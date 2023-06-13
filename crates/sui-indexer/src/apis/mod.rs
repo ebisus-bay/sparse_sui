@@ -16,5 +16,6 @@ mod governance_api;
 mod indexer_api;
 mod move_utils;
 mod read_api;
+pub mod seashrine_api;
 mod transaction_builder_api;
 mod write_api;

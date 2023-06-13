@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use async_trait::async_trait;
+use jsonrpsee::core::RpcResult;
 use prometheus::Histogram;
 
 use move_core_types::identifier::Identifier;
@@ -18,12 +19,15 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::ObjectRead;
 use sui_types::storage::ObjectStore;
 
+use crate::apis::seashrine_api::{CollectionPage, DisplayObjectsPage, ListingPage, NftFilter};
 use crate::errors::IndexerError;
 use crate::metrics::IndexerMetrics;
 use crate::models::addresses::{ActiveAddress, Address, AddressStats};
 use crate::models::checkpoints::Checkpoint;
+use crate::models::collection::Collection;
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
+use crate::models::listing::{DisplayObject, Listing};
 use crate::models::objects::{DeletedObject, Object, ObjectStatus};
 use crate::models::packages::Package;
 use crate::models::system_state::{DBSystemStateSummary, DBValidatorSummary};
@@ -55,6 +59,52 @@ pub trait IndexerStore {
         limit: Option<usize>,
         descending_order: bool,
     ) -> Result<EventPage, IndexerError>;
+
+    async fn get_display_object_for(
+        &self,
+        object_type: String,
+    ) -> Result<Option<Object>, IndexerError>;
+
+    async fn get_nft(&self, object_id: ObjectID) -> Result<DisplayObject, IndexerError>;
+
+    async fn get_display_objects_from_db(
+        &self,
+        query: NftFilter,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<DisplayObjectsPage>;
+
+    async fn get_active_listings(
+        &self,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<ListingPage>;
+
+    async fn get_all_collections(
+        &self,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<CollectionPage>;
+
+    async fn get_listing(&self, cursor: ObjectID) -> Result<Listing, IndexerError>;
+    async fn get_collection(&self, cursor: ObjectID) -> Result<Collection, IndexerError>;
+
+    async fn persist_collection_changes(
+        &self,
+        transaction_object_changes: &Vec<TransactionObjectChanges>,
+    ) -> Result<(), IndexerError>;
+
+    async fn persist_seashrine_listing_events(
+        &self,
+        create_listings: Vec<Listing>,
+        update_listings: Vec<Listing>,
+        buy_listings: Vec<Listing>,
+    ) -> Result<(), IndexerError>;
+
+    async fn persist_display_objects(&self, events: &[DisplayObject]) -> Result<(), IndexerError>;
 
     async fn get_object(
         &self,
@@ -318,7 +368,7 @@ pub struct TemporaryCheckpointStore {
     pub recipients: Vec<Recipient>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransactionObjectChanges {
     pub changed_objects: Vec<Object>,
     pub deleted_objects: Vec<DeletedObject>,

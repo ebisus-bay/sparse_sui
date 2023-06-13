@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use cached::proc_macro::once;
 use diesel::dsl::{count, max};
 use diesel::pg::PgConnection;
 use diesel::query_builder::AsQuery;
+use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sql_types::{BigInt, VarChar};
 use diesel::upsert::excluded;
 use diesel::{ExpressionMethods, PgArrayExpressionMethods};
@@ -18,9 +19,13 @@ use diesel::{OptionalExtension, QueryableByName};
 use diesel::{QueryDsl, RunQueryDsl};
 use fastcrypto::hash::Digest;
 use fastcrypto::traits::ToFromBytes;
+use jsonrpsee::core::RpcResult;
 use move_bytecode_utils::module_cache::SyncModuleCache;
 use move_core_types::identifier::Identifier;
+use move_core_types::language_storage::StructTag;
+use move_core_types::value::{MoveStruct, MoveValue};
 use prometheus::Histogram;
+use regex::Regex;
 use tracing::info;
 
 use sui_json_rpc::{ObjectProvider, ObjectProviderCache};
@@ -43,12 +48,20 @@ use sui_types::messages_checkpoint::{
 };
 use sui_types::object::ObjectRead;
 
+use crate::apis::seashrine_api::{
+    CollectionPage, CollectionStructure, DisplayObjectStructure, DisplayObjectsPage, ListingPage,
+    ListingStructure, NftFilter,
+};
 use crate::errors::{Context, IndexerError};
 use crate::metrics::IndexerMetrics;
 use crate::models::addresses::{ActiveAddress, Address, AddressStats, DBAddressStats};
 use crate::models::checkpoints::Checkpoint;
+use crate::models::collection::{
+    BpsRoyaltyStrategy, Collection, CollectionObject, MintCap, Supply,
+};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
+use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
 use crate::models::network_metrics::{DBMoveCallMetrics, DBNetworkMetrics};
 use crate::models::objects::{
     compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
@@ -58,9 +71,9 @@ use crate::models::system_state::DBValidatorSummary;
 use crate::models::transaction_index::{InputObject, MoveCall, Recipient};
 use crate::models::transactions::Transaction;
 use crate::schema::{
-    active_addresses, address_stats, addresses, checkpoints, epochs, events, input_objects,
-    move_calls, objects, objects_history, packages, recipients, system_states, transactions,
-    validators,
+    self, active_addresses, address_stats, addresses, checkpoints, collections, display_objects,
+    epochs, events, input_objects, move_calls, objects, objects_history, packages, recipients,
+    seashrine_listing, system_states, transactions, validators,
 };
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
 use crate::store::indexer_store::TemporaryCheckpointStore;
@@ -69,7 +82,7 @@ use crate::store::query::DBFilter;
 use crate::store::TransactionObjectChanges;
 use crate::store::{IndexerStore, TemporaryEpochStore};
 use crate::utils::{get_balance_changes_from_effect, get_object_changes};
-use crate::PgConnectionPool;
+use crate::{get_pg_pool_connection, PgConnectionPool};
 
 const MAX_EVENT_PAGE_SIZE: usize = 1000;
 const PG_COMMIT_CHUNK_SIZE: usize = 1000;
@@ -434,6 +447,563 @@ impl IndexerStore for PgIndexerStore {
             next_cursor,
             has_next_page,
         })
+    }
+
+    async fn get_display_object_for(
+        &self,
+        object_type: String,
+    ) -> Result<Option<Object>, IndexerError> {
+        let display_type = format!("0x2::display::Display<{}>", object_type);
+        // MUSTFIX (jian): add display field error support on implementation
+        let object = read_only_blocking!(&self.blocking_cp, |conn| {
+            objects::dsl::objects
+                .select((
+                    objects::epoch,
+                    objects::checkpoint,
+                    objects::object_id,
+                    objects::version,
+                    objects::object_digest,
+                    objects::owner_type,
+                    objects::owner_address,
+                    objects::initial_shared_version,
+                    objects::previous_transaction,
+                    objects::object_type,
+                    objects::object_status,
+                    objects::has_public_transfer,
+                    objects::storage_rebate,
+                    objects::bcs,
+                ))
+                .filter(objects::object_type.eq(display_type))
+                .first::<Object>(conn)
+                .optional()
+        });
+        object
+
+        // object.context(&format!("Failed reading object with type {display_type}"))?;
+    }
+
+    async fn get_display_objects_from_db(
+        &self,
+        query: NftFilter,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<DisplayObjectsPage> {
+        let mut boxed_query = display_objects::table
+            .inner_join(collections::table)
+            .into_boxed();
+
+        match query {
+            NftFilter::All => {}
+            NftFilter::Owner(owner) => {
+                boxed_query = boxed_query
+                    .filter(display_objects::dsl::owner_address.eq(Some(owner.to_string())));
+            }
+            NftFilter::Collection(base_type) => {
+                boxed_query = boxed_query.filter(display_objects::dsl::object_type.eq(base_type));
+            }
+        }
+
+        let mut page_limit = limit.unwrap_or(MAX_EVENT_PAGE_SIZE);
+        if page_limit > MAX_EVENT_PAGE_SIZE {
+            Err(IndexerError::InvalidArgumentError(format!(
+                "Limit {} exceeds the maximum page size {}",
+                page_limit, MAX_EVENT_PAGE_SIZE
+            )))?;
+        }
+        // fetch one more item to tell if there is next page
+        page_limit += 1;
+
+        let pg_cursor = if let Some(cursor) = cursor {
+            let display = self.get_nft(cursor).await?;
+            Some(display.object_id)
+        } else {
+            None
+        };
+
+        // Fetch a inner join.
+        let data: Vec<(DisplayObject, Collection)> =
+            read_only_blocking!(&self.blocking_cp, |conn| {
+                if let Some(pg_cursor) = pg_cursor {
+                    if descending_order {
+                        boxed_query =
+                            boxed_query.filter(display_objects::dsl::object_id.lt(pg_cursor))
+                    } else {
+                        boxed_query =
+                            boxed_query.filter(display_objects::dsl::object_id.gt(pg_cursor))
+                    }
+                }
+
+                if descending_order {
+                    boxed_query = boxed_query.order(display_objects::dsl::object_id.desc());
+                } else {
+                    boxed_query = boxed_query.order(display_objects::dsl::object_id.asc());
+                }
+                boxed_query
+                    // .select((DisplayObject::as_select(), Collection::as_select()))
+                    .load(conn)
+            })
+            .context("Error while reading from the database")?;
+
+        let display_obj_structure_vec: Vec<DisplayObjectStructure> = data
+            .into_iter()
+            .map(|d| d.into())
+            .collect::<Vec<DisplayObjectStructure>>();
+
+        Ok(DisplayObjectsPage {
+            data: display_obj_structure_vec,
+            next_cursor: None,
+            has_next_page: false,
+        })
+    }
+
+    async fn get_active_listings(
+        &self,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<ListingPage> {
+        let mut boxed_query = seashrine_listing::table
+            .inner_join(display_objects::table.inner_join(collections::table))
+            .into_boxed();
+
+        let mut page_limit = limit.unwrap_or(MAX_EVENT_PAGE_SIZE);
+        if page_limit > MAX_EVENT_PAGE_SIZE {
+            Err(IndexerError::InvalidArgumentError(format!(
+                "Limit {} exceeds the maximum page size {}",
+                page_limit, MAX_EVENT_PAGE_SIZE
+            )))?;
+        }
+        page_limit += 1;
+
+        let pg_cursor = if let Some(cursor) = cursor {
+            Some(self.get_listing(cursor).await?.listing_id)
+        } else {
+            None
+        };
+
+        let seashrine_listing_vec = read_only_blocking!(&self.blocking_cp, |conn| {
+            if let Some(pg_cursor) = pg_cursor {
+                if descending_order {
+                    boxed_query =
+                        boxed_query.filter(seashrine_listing::dsl::listing_id.lt(pg_cursor));
+                } else {
+                    boxed_query =
+                        boxed_query.filter(seashrine_listing::dsl::listing_id.gt(pg_cursor));
+                }
+            }
+
+            if descending_order {
+                boxed_query = boxed_query.order(seashrine_listing::dsl::listing_id.desc());
+            } else {
+                boxed_query = boxed_query.order(seashrine_listing::dsl::listing_id.asc());
+            }
+
+            boxed_query.load::<(Listing, (DisplayObject, Collection))>(conn)
+        })
+        .context("Failed reading active listings from PostgresDB")?;
+        let mut listings_vec = seashrine_listing_vec
+            .into_iter()
+            .map(|listing| {
+                // Return ListingStructure
+                listing.into()
+            })
+            .collect::<Vec<ListingStructure>>();
+        page_limit -= 1;
+        let has_next_page = listings_vec.len() > page_limit;
+        listings_vec.truncate(page_limit);
+        let next_cursor = listings_vec.last().map(|e| e.object_id.clone());
+
+        Ok(ListingPage {
+            data: listings_vec,
+            next_cursor,
+            has_next_page,
+        })
+    }
+
+    async fn get_all_collections(
+        &self,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+        descending_order: bool,
+    ) -> RpcResult<CollectionPage> {
+        let mut boxed_query = collections::table::into_boxed(collections::table);
+        let mut page_limit = limit.unwrap_or(MAX_EVENT_PAGE_SIZE);
+        if page_limit > MAX_EVENT_PAGE_SIZE {
+            Err(IndexerError::InvalidArgumentError(format!(
+                "Limit {} exceeds the maximum page size {}",
+                page_limit, MAX_EVENT_PAGE_SIZE
+            )))?;
+        }
+        page_limit += 1;
+
+        let pg_cursor = if let Some(cursor) = cursor {
+            let collection = self.get_collection(cursor).await?;
+            Some(collection.collection_object.unwrap_or_default())
+        } else {
+            None
+        };
+
+        let collection_vec: Vec<Collection> = read_only_blocking!(&self.blocking_cp, |conn| {
+            if let Some(pg_cursor) = pg_cursor {
+                if descending_order {
+                    boxed_query =
+                        boxed_query.filter(collections::dsl::collection_object.lt(pg_cursor));
+                } else {
+                    boxed_query =
+                        boxed_query.filter(collections::dsl::collection_object.gt(pg_cursor));
+                }
+            }
+
+            if descending_order {
+                boxed_query = boxed_query.order(collections::dsl::collection_object.desc());
+            } else {
+                boxed_query = boxed_query.order(collections::dsl::collection_object.asc());
+            }
+            boxed_query.load(conn)
+        })
+        .context("Failed reading collections from PostgresDB")?;
+
+        let mut collection_structure_vec = collection_vec
+            .into_iter()
+            .map(|c| {
+                // Return ListingStructure
+                c.into()
+            })
+            .collect::<Vec<CollectionStructure>>();
+
+        page_limit -= 1;
+        let has_next_page = collection_structure_vec.len() > page_limit;
+        collection_structure_vec.truncate(page_limit);
+        let next_cursor = collection_structure_vec
+            .last()
+            .map(|e| e.collection_object_id.clone());
+
+        Ok(CollectionPage {
+            data: collection_structure_vec,
+            next_cursor,
+            has_next_page,
+        })
+    }
+
+    async fn get_listing(&self, cursor: ObjectID) -> Result<Listing, IndexerError> {
+        read_only_blocking!(&self.blocking_cp, |conn| seashrine_listing::table
+            .filter(seashrine_listing::dsl::listing_id.eq(cursor.to_string()))
+            .first::<Listing>(conn))
+        .context("Failed reading event from PostgresDB")
+    }
+
+    async fn get_collection(&self, cursor: ObjectID) -> Result<Collection, IndexerError> {
+        read_only_blocking!(&self.blocking_cp, |conn| collections::table
+            .filter(collections::dsl::collection_object.eq(Some(cursor.to_string())))
+            .first::<Collection>(conn))
+        .context("Failed reading collection from PostgresDB")
+    }
+
+    async fn get_nft(&self, object_id: ObjectID) -> Result<DisplayObject, IndexerError> {
+        read_only_blocking!(&self.blocking_cp, |conn| {
+            display_objects::table
+                .filter(display_objects::dsl::object_id.eq(object_id.to_string()))
+                .first::<DisplayObject>(conn)
+        })
+        .context("Failed reading NFT from the PostgresDB")
+    }
+
+    /// Deserializes `Collection`, `MintCap`, `BpsRoyaltyStrategy`.
+    /// and store into the `collections` table.
+    async fn persist_collection_changes(
+        &self,
+        transaction_object_changes: &Vec<TransactionObjectChanges>,
+    ) -> Result<(), IndexerError> {
+        use crate::schema::collections::dsl::*;
+
+        // TODO: Not parse everywhere.
+        let indexer_config = IndexerModuleConfig::parse();
+
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            // Get all the mutated objects
+            let mutated_objects: Vec<Object> = transaction_object_changes
+                .iter()
+                .flat_map(|changes| changes.changed_objects.iter().cloned())
+                .collect();
+
+            // Fetch all the collection objects.
+            let filtered_collections: Vec<Collection> = mutated_objects
+                .clone()
+                .into_iter()
+                .filter(|o| {
+                    let is_match = generate_re_for_type(
+                        indexer_config.collection_object.clone(),
+                        String::from("collection::Collection"),
+                    )
+                    .unwrap()
+                    .is_match(o.object_type.as_str());
+                    if o.object_type.contains("collection::Collection") {
+                        println!("Collection: {:?}, {:?}", o.object_type, is_match);
+                    }
+                    is_match
+                })
+                .map(|o| {
+                    let cb = bcs::from_bytes::<CollectionObject>(o.bcs[0].1.as_slice()).unwrap();
+                    println!("Collection deserailized: {:?}", cb);
+                    let matches = Regex::new(r"<[a-zA-Z0-9_]*::[a-zA-Z0-9_]*::[a-zA-Z0-9_]*>")
+                        .unwrap()
+                        .captures(o.object_type.as_str())
+                        .unwrap();
+                    if matches.len() == 0 {
+                        panic!("Can't match the base type.");
+                    };
+                    let parsed_base_type = &matches[0];
+                    let parsed_val = parsed_base_type.replace("<", "").replace(">", "");
+
+                    Collection {
+                        base_type: parsed_val,
+                        collection_object: Some(cb.id.id.bytes.to_string()),
+                        mint_cap_object: None,
+                        collection_max_supply: None,
+                        collection_current_supply: None,
+                        bps_royalty_strategy_object: None,
+                        royalty_fee_bps: None,
+                    }
+                })
+                .collect();
+
+            // Save the collection objects.
+            diesel::insert_into(schema::collections::table)
+                .values(filtered_collections)
+                .on_conflict_do_nothing()
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing the collections to the PostgresDB")?;
+
+            // // FIXME: Deserializing issue.
+            // // Get the DisplayInfo for the collection.
+            // let display_infos: Vec<Collection> = mutated_objects
+            //     .clone()
+            //     .into_iter()
+            //     .filter(|o| {
+            //         // Type will be like
+            //         // 0x2::dynamic_field::Field<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::utils::Marker<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>, 0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>
+            //         let is_match = generate_re_for_df(
+            //             indexer_config.marker.clone(),
+            //             indexer_config.display_info.clone(),
+            //         )
+            //         .unwrap()
+            //         .is_match(o.object_type.as_str());
+            //         if o.object_type.contains("dynamic_field::Field") {
+            //             println!("Dynamic Field: {:?}", is_match);
+            //         }
+            //         is_match
+            //     })
+            //     .map(|o| {
+            //         let display_info_df: Field<Marker, DisplayInfo> =
+            //             bcs::from_bytes(o.bcs[0].1.as_slice()).unwrap();
+            //         println!("DisplayInfo: {:?}", display_info_df.value.clone());
+            //         let base_type =
+            //         Collection {
+            //             base_type: base_type,
+            //             collection_name: Some(display_info_df.value.name),
+            //             collection_description: Some(display_info_df.value.description),
+            //             collection_object: None,
+            //             mint_cap_object: None,
+            //             collection_max_supply: None,
+            //             collection_current_supply: None,
+            //             bps_royalty_strategy_object: None,
+            //             royalty_fee_bps: None,
+            //         }
+            //     })
+            //     .collect();
+
+            // // Save the mint cap objects.
+            // diesel::insert_into(schema::collections::table)
+            //     .values(mint_caps)
+            //     .on_conflict(base_type)
+            //     .do_update()
+            //     .set((
+            //         mint_cap_object.eq(excluded(mint_cap_object)),
+            //         collection_max_supply.eq(excluded(collection_max_supply)),
+            //         collection_current_supply.eq(excluded(collection_current_supply)),
+            //     ))
+            //     .execute(conn)
+            //     .map_err(IndexerError::from)
+            //     .context("Failed writing the collections to the PostgresDB")?;
+
+            let mint_caps: Vec<Collection> = mutated_objects
+                .clone()
+                .into_iter()
+                .filter(|o| {
+                    generate_re_for_type(
+                        indexer_config.mint_cap_object.clone(),
+                        String::from("mint_cap::MintCap"),
+                    )
+                    .unwrap()
+                    .is_match(o.object_type.as_str())
+                })
+                .map(|o| {
+                    let mint_cap: MintCap = bcs::from_bytes(o.bcs[0].1.as_slice()).unwrap();
+                    let matches = Regex::new(r"<[a-zA-Z0-9_]*::[a-zA-Z0-9_]*::[a-zA-Z0-9_]*>")
+                        .unwrap()
+                        .captures(o.object_type.as_str())
+                        .unwrap();
+                    if matches.len() == 0 {
+                        panic!("Can't match the base type.");
+                    };
+                    let parsed_base_type = &matches[0];
+                    let supply = mint_cap.supply.unwrap_or_else(|| Supply::new(0, 0));
+                    let parsed_val = parsed_base_type.replace("<", "").replace(">", "");
+
+                    Collection {
+                        base_type: parsed_val,
+                        collection_object: None,
+                        mint_cap_object: Some(mint_cap.id.id.bytes.to_string()),
+                        collection_max_supply: Some(supply.max as i64),
+                        collection_current_supply: Some(supply.current as i64),
+                        bps_royalty_strategy_object: None,
+                        royalty_fee_bps: None,
+                    }
+                })
+                .collect();
+
+            // Save the mint cap objects.
+            diesel::insert_into(schema::collections::table)
+                .values(mint_caps)
+                .on_conflict(base_type)
+                .do_update()
+                .set((
+                    mint_cap_object.eq(excluded(mint_cap_object)),
+                    collection_max_supply.eq(excluded(collection_max_supply)),
+                    collection_current_supply.eq(excluded(collection_current_supply)),
+                ))
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing the collections to the PostgresDB")?;
+
+            // FIXME: Can't deseralize BpsRoyaltyStrategy
+            // Save the royalty strategies
+            let royalty_strategies: Vec<Collection> = mutated_objects
+                .clone()
+                .into_iter()
+                .filter(|o| {
+                    generate_re_for_type(
+                        indexer_config.bps_royalty_strategy_object.clone(),
+                        String::from("royalty_strategy_bps::BpsRoyaltyStrategy"),
+                    )
+                    .unwrap()
+                    .is_match(o.object_type.as_str())
+                })
+                .map(|o| {
+                    let bps = bcs::from_bytes::<BpsRoyaltyStrategy>(o.bcs[0].1.as_slice()).unwrap();
+                    let matches = Regex::new(r"<[a-zA-Z0-9_]*::[a-zA-Z0-9_]*::[a-zA-Z0-9_]*>")
+                        .unwrap()
+                        .captures(o.object_type.as_str())
+                        .unwrap();
+                    if matches.len() == 0 {
+                        panic!("Can't match the base type.");
+                    };
+                    let parsed_base_type = &matches[0];
+                    let parsed_val = parsed_base_type.replace("<", "").replace(">", "");
+
+                    Collection {
+                        base_type: parsed_val,
+                        collection_object: None,
+                        mint_cap_object: None,
+                        collection_max_supply: None,
+                        collection_current_supply: None,
+                        // bps_royalty_strategy_object: Some(bps.id.id.bytes.to_string()),
+                        bps_royalty_strategy_object: Some(String::from(o.object_id.as_str())),
+                        royalty_fee_bps: Some(bps.royalty_fee_bps as i64),
+                    }
+                })
+                .collect();
+
+            // Save into DB
+            diesel::insert_into(schema::collections::table)
+                .values(royalty_strategies)
+                .on_conflict(base_type)
+                .do_update()
+                .set((
+                    bps_royalty_strategy_object.eq(excluded(bps_royalty_strategy_object)),
+                    royalty_fee_bps.eq(excluded(royalty_fee_bps)),
+                ))
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing the collections to the PostgresDB")?;
+
+            Ok::<(), IndexerError>(())
+        });
+
+        Ok(())
+    }
+
+    async fn persist_seashrine_listing_events(
+        &self,
+        create_listings: Vec<Listing>,
+        update_listings: Vec<Listing>,
+        buy_listings: Vec<Listing>,
+    ) -> Result<(), IndexerError> {
+        use crate::schema::seashrine_listing::dsl::*;
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            for listing in create_listings.chunks(PG_COMMIT_CHUNK_SIZE) {
+                diesel::insert_into(
+                    crate::store::pg_indexer_store::seashrine_listing::dsl::seashrine_listing,
+                )
+                .values(listing)
+                .on_conflict_do_nothing()
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing seashrine listing to PostgresDB")?;
+            }
+
+            // Save the update listing events
+            for listing in update_listings {
+                diesel::update(
+                    crate::store::pg_indexer_store::seashrine_listing::dsl::seashrine_listing,
+                )
+                .filter(listing_id.eq(listing.listing_id.clone()))
+                .set((
+                    price.eq(listing.price),
+                    listing_id.eq(listing.listing_id),
+                    created_at.eq(listing.created_at),
+                ))
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing seashrine listing to PostgresDB")?;
+            }
+
+            // Save the buy listing events
+            for listing in buy_listings {
+                diesel::update(
+                    crate::store::pg_indexer_store::seashrine_listing::dsl::seashrine_listing,
+                )
+                .filter(listing_id.eq(listing.listing_id.clone()))
+                .set((
+                    buyer.eq(listing.buyer),
+                    bought_at.eq(listing.bought_at),
+                    listing_status.eq(listing.listing_status),
+                ))
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed writing seashrine listing to PostgresDB")?;
+            }
+            Ok::<(), IndexerError>(())
+        })?;
+
+        Ok(())
+    }
+
+    async fn persist_display_objects(&self, events: &[DisplayObject]) -> Result<(), IndexerError> {
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            for event_chunk in events.chunks(PG_COMMIT_CHUNK_SIZE) {
+                diesel::insert_into(display_objects::table)
+                    .values(event_chunk)
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .map_err(IndexerError::from)
+                    .context("Failed writing events to PostgresDB")?;
+            }
+            Ok::<(), IndexerError>(())
+        })?;
+        Ok(())
     }
 
     async fn get_total_transaction_number_from_checkpoints(&self) -> Result<i64, IndexerError> {
@@ -1870,6 +2440,186 @@ fn persist_transaction_object_changes(
         }
     }
     Ok(0)
+}
+
+pub fn get_move_value_type(val: &MoveValue) -> Option<StructTag> {
+    let type_ = match val {
+        MoveValue::Struct(move_struct) => match move_struct {
+            MoveStruct::WithTypes { type_, fields } => Some(type_.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    type_
+}
+
+pub fn generate_re_for_type(object_id: String, type_: String) -> Result<Regex, regex::Error> {
+    let full_type = format!(
+        "{}::{}<[a-zA-Z0-9_]*::[a-zA-Z0-9_]*::[a-zA-Z0-9_]*>",
+        object_id, type_
+    );
+    Regex::new(&full_type)
+}
+
+pub fn generate_re_for_df(marker: String, display_info: String) -> Result<Regex, regex::Error> {
+    // 0x2::dynamic_field::Field<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::utils::Marker<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>, 0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>
+    let full_type = format!(
+        "0x2::dynamic_field::Field<{}::utils::Marker<{}::display_info::DisplayInfo>, {}::display_info::DisplayInfo>",
+        marker,
+        display_info,
+        display_info
+    );
+    Regex::new(&full_type)
+}
+
+pub fn does_object_exists(
+    blocking_cp: &Pool<ConnectionManager<PgConnection>>,
+    type_: String,
+) -> bool {
+    let mut conn = get_pg_pool_connection(blocking_cp).unwrap();
+    let object = objects::dsl::objects
+        .select((
+            objects::epoch,
+            objects::checkpoint,
+            objects::object_id,
+            objects::version,
+            objects::object_digest,
+            objects::owner_type,
+            objects::owner_address,
+            objects::initial_shared_version,
+            objects::previous_transaction,
+            objects::object_type,
+            objects::object_status,
+            objects::has_public_transfer,
+            objects::storage_rebate,
+            objects::bcs,
+        ))
+        .filter(objects::object_type.eq(type_))
+        .first::<Object>(&mut conn)
+        .optional();
+    let result = match object {
+        Ok(optional_ob) => match optional_ob {
+            Some(val) => true,
+            None => false,
+        },
+        Err(e) => false,
+    };
+    result
+}
+
+pub fn simple_fields_map(val: &MoveValue) -> HashMap<String, String> {
+    let mut field_map: HashMap<String, String> = HashMap::new();
+    let nft = val;
+    match nft {
+        MoveValue::Struct(move_struct) => match move_struct {
+            MoveStruct::WithTypes { type_, fields } => {
+                println!("Struct with types");
+                // Iterate over the fields of struct to parse string?
+                for field in fields.into_iter() {
+                    println!("Struct field name: {:?}", &field.0);
+
+                    // Parse the move value
+                    match field.clone().1 {
+                        MoveValue::Struct(move_struct) => {
+                            if is_string_struct(&move_struct) {
+                                let resolved = resolve_string(&move_struct);
+                                println!("Corresponding string: {:?}", &resolved);
+                                field_map.insert(field.clone().0.into_string(), resolved);
+                            } else if is_url_struct(&move_struct) {
+                                let resolved = resolve_url(&move_struct);
+                                println!("Corresponding string: {:?}", &resolved);
+                                field_map.insert(field.clone().0.into_string(), resolved);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    };
+    field_map
+}
+
+pub fn is_string_struct(move_struct: &MoveStruct) -> bool {
+    match move_struct {
+        MoveStruct::WithTypes { type_, fields } => {
+            if type_.address.to_canonical_string()
+                == "0000000000000000000000000000000000000000000000000000000000000001"
+                && (type_.module.clone().into_string() == "string"
+                    || type_.module.clone().into_string() == "ascii")
+                && type_.name.clone().into_string() == "String"
+            {
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+pub fn is_url_struct(move_struct: &MoveStruct) -> bool {
+    match move_struct {
+        MoveStruct::WithTypes { type_, fields } => {
+            if type_.address.to_canonical_string()
+                == "0000000000000000000000000000000000000000000000000000000000000002"
+                && type_.module.clone().into_string() == "url"
+                && type_.name.clone().into_string() == "Url"
+            {
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+pub fn resolve_url(move_struct: &MoveStruct) -> String {
+    match move_struct {
+        MoveStruct::WithTypes { type_, fields } => {
+            assert!(is_url_struct(move_struct) && fields.len() == 1);
+            let val = &fields[0];
+            match val.clone().1 {
+                MoveValue::Struct(move_string_struct) => resolve_string(&move_string_struct),
+                _ => panic!("Something"),
+            }
+            // resolve_string()
+        }
+        _ => panic!("Not with type"),
+    }
+}
+
+// fn resolve_move_struct(move_struct: &MoveStruct) -> HashMap<String, >
+
+/// Convert the MoveStrcut for `0x1::string::String` into a rust String
+pub fn resolve_string(move_struct: &MoveStruct) -> String {
+    assert!(is_string_struct(move_struct));
+    match move_struct {
+        MoveStruct::WithTypes { type_, fields } => {
+            assert!(fields.len() == 1);
+            let val = &fields[0];
+            assert!(val.clone().0.into_string() == "bytes");
+            let str_val = match val.clone().1 {
+                MoveValue::Vector(move_val_vector) => {
+                    let string_val_vec_u8: Vec<u8> = move_val_vector
+                        .into_iter()
+                        .map(|chr| match chr {
+                            MoveValue::U8(chr) => chr,
+                            _ => panic!("Not a u8"),
+                        })
+                        .collect();
+                    string_val_vec_u8
+                }
+                _ => panic!("Not a string vector"),
+            };
+            String::from_utf8(str_val).unwrap()
+        }
+        _ => {
+            panic!("You've passed a wrong string struct");
+        }
+    }
 }
 
 #[derive(Clone)]

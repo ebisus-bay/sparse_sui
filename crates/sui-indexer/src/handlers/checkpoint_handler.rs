@@ -32,8 +32,6 @@ use sui_types::sui_system_state::{get_sui_system_state, SuiSystemStateTrait};
 use sui_types::transaction::SenderSignedData;
 use sui_types::SUI_SYSTEM_ADDRESS;
 
-use crate::errors::IndexerError;
-use crate::metrics::IndexerMetrics;
 use crate::models::checkpoints::Checkpoint;
 use crate::models::epoch::{DBEpochInfo, SystemEpochInfoEvent};
 use crate::models::objects::{DeletedObject, Object, ObjectStatus};
@@ -46,6 +44,8 @@ use crate::store::{
 use crate::types::{CheckpointTransactionBlockResponse, TemporaryTransactionBlockResponseStore};
 use crate::utils::multi_get_full_transactions;
 use crate::IndexerConfig;
+use crate::{errors::IndexerError, models::listing::Listing};
+use crate::{metrics::IndexerMetrics, models::listing::IndexerModuleConfig};
 
 const MAX_PARALLEL_DOWNLOADS: usize = 24;
 const DOWNLOAD_RETRY_INTERVAL_IN_SECS: u64 = 10;
@@ -293,6 +293,8 @@ where
                     continue;
                 }
 
+                let indexer_config = IndexerModuleConfig::parse();
+
                 // Write checkpoint to DB
                 let TemporaryCheckpointStore {
                     checkpoint,
@@ -305,6 +307,67 @@ where
                     recipients,
                 } = indexed_checkpoint;
                 let checkpoint_seq = checkpoint.sequence_number;
+
+                let (create_listings, update_listings, buy_listings) =
+                    Listing::events_to_seashrine_listing_events(
+                        events.clone(),
+                        indexer_config.clone(),
+                    );
+
+                // Persist seashrine listing events.
+                let events_handler = self.clone();
+                spawn_monitored_task!(async move {
+                    let mut event_commit_res = events_handler
+                        .state
+                        .persist_seashrine_listing_events(
+                            create_listings.clone(),
+                            update_listings.clone(),
+                            buy_listings.clone(),
+                        )
+                        .await;
+                    while let Err(e) = event_commit_res {
+                        warn!(
+                                "Indexer seashrine listing event commit failed with error: {:?}, retrying after {:?} milli-secs...",
+                                e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
+                            );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
+                        ))
+                        .await;
+                        event_commit_res = events_handler
+                            .state
+                            .persist_seashrine_listing_events(
+                                create_listings.clone(),
+                                update_listings.clone(),
+                                buy_listings.clone(),
+                            )
+                            .await;
+                    }
+                });
+
+                // Persist collection objects
+                let collection_object_handler = self.clone();
+                let cloned_object_changes = object_changes.clone();
+                spawn_monitored_task!(async move {
+                    let mut collection_changes_commit_res = collection_object_handler
+                        .state
+                        .persist_collection_changes(&cloned_object_changes)
+                        .await;
+                    while let Err(e) = collection_changes_commit_res {
+                        warn!(
+                            "Indexer transaction index tables commit failed with error: {:?}, retrying after {:?} milli-secs...",
+                            e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
+                        ))
+                        .await;
+                        collection_changes_commit_res = collection_object_handler
+                            .state
+                            .persist_collection_changes(&cloned_object_changes)
+                            .await;
+                    }
+                });
 
                 // NOTE: retrials are necessary here, otherwise results can be popped and discarded.
                 let events_handler = self.clone();

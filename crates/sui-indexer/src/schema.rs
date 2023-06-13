@@ -79,6 +79,32 @@ diesel::table! {
 }
 
 diesel::table! {
+    collections (base_type) {
+        base_type -> Varchar,
+        collection_object -> Nullable<Varchar>,
+        mint_cap_object -> Nullable<Varchar>,
+        collection_max_supply -> Nullable<Int8>,
+        collection_current_supply -> Nullable<Int8>,
+        bps_royalty_strategy_object -> Nullable<Varchar>,
+        royalty_fee_bps -> Nullable<Int8>,
+    }
+}
+
+diesel::table! {
+    display_objects (object_id) {
+        object_id -> Varchar,
+        object_type -> Varchar,
+        owner_address -> Nullable<Varchar>,
+        name -> Varchar,
+        link -> Varchar,
+        image_url -> Varchar,
+        description -> Varchar,
+        project_url -> Varchar,
+        creator -> Varchar,
+    }
+}
+
+diesel::table! {
     epochs (epoch) {
         epoch -> Int8,
         first_checkpoint_id -> Int8,
@@ -216,6 +242,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    seashrine_listing (listing_id) {
+        listing_id -> Text,
+        price -> Int8,
+        lister -> Varchar,
+        nft_id -> Text,
+        listing_status -> Int8,
+        buyer -> Nullable<Varchar>,
+        created_at -> Nullable<Timestamp>,
+        bought_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     system_states (epoch) {
         epoch -> Int8,
         protocol_version -> Int8,
@@ -321,12 +360,17 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(display_objects -> collections (object_type));
+diesel::joinable!(seashrine_listing -> display_objects (nft_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     active_addresses,
     address_stats,
     addresses,
     at_risk_validators,
     checkpoints,
+    collections,
+    display_objects,
     epochs,
     events,
     input_objects,
@@ -335,6 +379,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     objects_history,
     packages,
     recipients,
+    seashrine_listing,
     system_states,
     transactions,
     validators,

@@ -42,6 +42,13 @@ sui-open-rpc = { path = "../sui-open-rpc" }
 sui-sdk = { path = "../sui-sdk" }
 sui-types = { path = "../sui-types" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# For RPC
+jsonrpsee-proc-macros = {git="https://github.com/wlmyng/jsonrpsee.git", rev= "b1b300784795f6a64d0fcdf8f03081a9bc38bde8"}
+sui-open-rpc-macros = { path = "../sui-open-rpc-macros" }
+serde_with = { version = "2.1.0", features = ["hex"] }
+schemars = { version = "0.8.10", features = ["either"] }
+
 telemetry-subscribers.workspace = true
 
 move-core-types.workspace = true
