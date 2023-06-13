@@ -8,9 +8,8 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use cached::proc_macro::once;
-use diesel::dsl::{count, exists, max};
+use diesel::dsl::{count, max};
 use diesel::pg::PgConnection;
-use diesel::prelude::*;
 use diesel::query_builder::AsQuery;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sql_types::{BigInt, VarChar};
@@ -716,6 +715,7 @@ impl IndexerStore for PgIndexerStore {
     async fn persist_collection_changes(
         &self,
         transaction_object_changes: &Vec<TransactionObjectChanges>,
+        indexer_store: IndexerModuleConfig,
     ) -> Result<(), IndexerError> {
         use crate::schema::collections::dsl::*;
 
@@ -942,6 +942,7 @@ impl IndexerStore for PgIndexerStore {
         create_listings: Vec<Listing>,
         update_listings: Vec<Listing>,
         buy_listings: Vec<Listing>,
+        indexer_config: IndexerModuleConfig,
     ) -> Result<(), IndexerError> {
         use crate::schema::seashrine_listing::dsl::*;
         transactional_blocking!(&self.blocking_cp, |conn| {

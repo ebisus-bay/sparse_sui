@@ -323,6 +323,7 @@ where
                             create_listings.clone(),
                             update_listings.clone(),
                             buy_listings.clone(),
+                            indexer_config.clone(),
                         )
                         .await;
                     while let Err(e) = event_commit_res {
@@ -340,6 +341,7 @@ where
                                 create_listings.clone(),
                                 update_listings.clone(),
                                 buy_listings.clone(),
+                                indexer_config.clone(),
                             )
                             .await;
                     }
@@ -351,7 +353,7 @@ where
                 spawn_monitored_task!(async move {
                     let mut collection_changes_commit_res = collection_object_handler
                         .state
-                        .persist_collection_changes(&cloned_object_changes)
+                        .persist_collection_changes(&cloned_object_changes, indexer_config.clone())
                         .await;
                     while let Err(e) = collection_changes_commit_res {
                         warn!(
@@ -364,7 +366,10 @@ where
                         .await;
                         collection_changes_commit_res = collection_object_handler
                             .state
-                            .persist_collection_changes(&cloned_object_changes)
+                            .persist_collection_changes(
+                                &cloned_object_changes,
+                                indexer_config.clone(),
+                            )
                             .await;
                     }
                 });

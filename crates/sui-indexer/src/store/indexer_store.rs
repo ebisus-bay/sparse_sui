@@ -27,7 +27,7 @@ use crate::models::checkpoints::Checkpoint;
 use crate::models::collection::Collection;
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
-use crate::models::listing::{DisplayObject, Listing};
+use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
 use crate::models::objects::{DeletedObject, Object, ObjectStatus};
 use crate::models::packages::Package;
 use crate::models::system_state::{DBSystemStateSummary, DBValidatorSummary};
@@ -95,6 +95,7 @@ pub trait IndexerStore {
     async fn persist_collection_changes(
         &self,
         transaction_object_changes: &Vec<TransactionObjectChanges>,
+        indexer_store: IndexerModuleConfig,
     ) -> Result<(), IndexerError>;
 
     async fn persist_seashrine_listing_events(
@@ -102,6 +103,7 @@ pub trait IndexerStore {
         create_listings: Vec<Listing>,
         update_listings: Vec<Listing>,
         buy_listings: Vec<Listing>,
+        indexer_config: IndexerModuleConfig,
     ) -> Result<(), IndexerError>;
 
     async fn persist_display_objects(&self, events: &[DisplayObject]) -> Result<(), IndexerError>;
