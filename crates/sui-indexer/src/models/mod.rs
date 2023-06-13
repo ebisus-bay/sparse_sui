@@ -4,6 +4,7 @@
 pub mod addresses;
 pub mod checkpoints;
 pub mod collection;
+pub mod dynamic_indexing;
 pub mod epoch;
 pub mod events;
 pub mod listing;

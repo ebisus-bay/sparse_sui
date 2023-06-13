@@ -8,44 +8,44 @@ use sui_types::{
 
 use super::listing::VecMap;
 
-/**
+/*
  * ## Types from the library.
  *
-/// `MintCap<T>` delegates the capability of it's owner to mint `T`
- struct MintCap<phantom T> has key, store {
-     /// `MintCap` ID
-     id: UID,
-    /// ID of the `Collection` that `MintCap` controls.
-    ///
-    /// Intended for discovery.
-    collection_id: ID,
-    /// Supply that `MintCap` can mint
-    supply: Option<Supply>,
-}
-
-/// `Supply` tracks supply parameters
-struct Supply has store, drop {
-    max: u64,
-    current: u64,
-}
-
-/// A shared object which can be used to add receipts of type
-/// `BpsRoyaltyStrategyRule` to `TransferRequest`.
-struct BpsRoyaltyStrategy<phantom T> has key {
-    id: UID,
-    version: u64,
-    /// Royalty charged on trades in basis points
-    royalty_fee_bps: u16,
-    /// Allows this middleware to touch the balance paid.
-    /// The balance is deducted from the transfer request.
-    /// See the docs for `BalanceAccessCap` for more info.
-    access_cap: Option<BalanceAccessCap<T>>,
-    /// Contains balances of various currencies.
-    aggregator: Balances,
-    /// If set to false, won't give receipts to `TransferRequest`.
-    is_enabled: bool,
-}
-*/
+ * /// `MintCap<T>` delegates the capability of it's owner to mint `T`
+ *  struct MintCap<phantom T> has key, store {
+ *      /// `MintCap` ID
+ *      id: UID,
+ *     /// ID of the `Collection` that `MintCap` controls.
+ * ///
+ *     /// Intended for discovery.
+ *     collection_id: ID,
+ *     /// Supply that `MintCap` can mint
+ *     supply: Option<Supply>,
+ * }
+ *
+ * /// `Supply` tracks supply parameters
+ * struct Supply has store, drop {
+ *     max: u64,
+ *     current: u64,
+ * }
+ *
+ * /// A shared object which can be used to add receipts of type
+ * /// `BpsRoyaltyStrategyRule` to `TransferRequest`.
+ * struct BpsRoyaltyStrategy<phantom T> has key {
+ *     id: UID,
+ *     version: u64,
+ *     /// Royalty charged on trades in basis points
+ *     royalty_fee_bps: u16,
+ *     /// Allows this middleware to touch the balance paid.
+ *     /// The balance is deducted from the transfer request.
+ *     /// See the docs for `BalanceAccessCap` for more info.
+ *     access_cap: Option<BalanceAccessCap<T>>,
+ *     /// Contains balances of various currencies.
+ *     aggregator: Balances,
+ *     /// If set to false, won't give receipts to `TransferRequest`.
+ *     is_enabled: bool,
+ * }
+ * */
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Supply {

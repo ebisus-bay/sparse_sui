@@ -105,6 +105,12 @@ diesel::table! {
 }
 
 diesel::table! {
+    dynamic_indexing_events (event_type) {
+        event_type -> Text,
+    }
+}
+
+diesel::table! {
     epochs (epoch) {
         epoch -> Int8,
         first_checkpoint_id -> Int8,
@@ -371,6 +377,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     checkpoints,
     collections,
     display_objects,
+    dynamic_indexing_events,
     epochs,
     events,
     input_objects,

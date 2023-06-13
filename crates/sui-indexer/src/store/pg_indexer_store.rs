@@ -8,8 +8,9 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use cached::proc_macro::once;
-use diesel::dsl::{count, max};
+use diesel::dsl::{count, exists, max};
 use diesel::pg::PgConnection;
+use diesel::prelude::*;
 use diesel::query_builder::AsQuery;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sql_types::{BigInt, VarChar};
@@ -59,6 +60,7 @@ use crate::models::checkpoints::Checkpoint;
 use crate::models::collection::{
     BpsRoyaltyStrategy, Collection, CollectionObject, MintCap, Supply,
 };
+use crate::models::dynamic_indexing::should_index_event_type;
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
 use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
@@ -72,8 +74,8 @@ use crate::models::transaction_index::{InputObject, MoveCall, Recipient};
 use crate::models::transactions::Transaction;
 use crate::schema::{
     self, active_addresses, address_stats, addresses, checkpoints, collections, display_objects,
-    epochs, events, input_objects, move_calls, objects, objects_history, packages, recipients,
-    seashrine_listing, system_states, transactions, validators,
+    dynamic_indexing_events, epochs, events, input_objects, move_calls, objects, objects_history,
+    packages, recipients, seashrine_listing, system_states, transactions, validators,
 };
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
 use crate::store::indexer_store::TemporaryCheckpointStore;
@@ -1945,8 +1947,40 @@ WHERE e1.epoch = e2.epoch
         Ok(())
     }
 
+    async fn event_type_exists(&self, event_type: String) -> Result<bool, IndexerError> {
+        read_only_blocking!(&self.blocking_cp, |conn| {
+            let val: Option<String> = dynamic_indexing_events::table
+                .select(dynamic_indexing_events::event_type)
+                .filter(dynamic_indexing_events::event_type.eq(event_type))
+                .first::<String>(conn)
+                .optional()?;
+            match val {
+                Some(_) => Ok::<bool, IndexerError>(true),
+                None => Ok::<bool, IndexerError>(false),
+            }
+        })
+        .context("Failed while getting event type from `dynamic_indexing_events`")
+    }
+
     async fn persist_events(&self, events: &[Event]) -> Result<(), IndexerError> {
         transactional_blocking!(&self.blocking_cp, |conn| {
+            // Delete all the records from `events` whose `event_type` doesn't exists in the `dynamic_indexing_events`.
+            // WHY: To sync deleted events from `dynamic_indexing_events` to `events`.
+            diesel::delete(events::table)
+                .filter(diesel::dsl::not(events::event_type.eq_any(
+                    dynamic_indexing_events::table.select(dynamic_indexing_events::event_type),
+                )))
+                .execute(conn)?;
+
+            let events = events
+                .into_iter()
+                .filter(|event| {
+                    should_index_event_type(&self.blocking_cp, event.event_type.clone())
+                })
+                .map(|e| e.clone())
+                .collect::<Vec<Event>>();
+
+            // only insert if the event type is already in the table `dynamic_indexing_events`
             for event_chunk in events.chunks(PG_COMMIT_CHUNK_SIZE) {
                 diesel::insert_into(events::table)
                     .values(event_chunk)
@@ -2476,7 +2510,8 @@ pub fn does_object_exists(
     blocking_cp: &Pool<ConnectionManager<PgConnection>>,
     type_: String,
 ) -> bool {
-    let mut conn = get_pg_pool_connection(blocking_cp).unwrap();
+    let mut conn: diesel::r2d2::PooledConnection<ConnectionManager<PgConnection>> =
+        get_pg_pool_connection(blocking_cp).unwrap();
     let object = objects::dsl::objects
         .select((
             objects::epoch,

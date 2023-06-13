@@ -269,6 +269,9 @@ pub trait IndexerStore {
         object_mutation_latency: Histogram,
         object_deletion_latency: Histogram,
     ) -> Result<(), IndexerError>;
+
+    async fn event_type_exists(&self, event_type: String) -> Result<bool, IndexerError>;
+
     async fn persist_events(&self, events: &[Event]) -> Result<(), IndexerError>;
     async fn persist_addresses(
         &self,
