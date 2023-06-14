@@ -274,12 +274,14 @@ pub trait IndexerStore {
 
     async fn event_type_exists(&self, event_type: String) -> Result<bool, IndexerError>;
 
-    async fn persist_events(&self, events: &[Event]) -> Result<(), IndexerError>;
+    async fn persist_events(&self, events: &[Event], seq_number: i64) -> Result<(), IndexerError>;
+
     async fn persist_addresses(
         &self,
         addresses: &[Address],
         active_addresses: &[ActiveAddress],
     ) -> Result<(), IndexerError>;
+
     async fn persist_packages(&self, packages: &[Package]) -> Result<(), IndexerError>;
     // NOTE: these tables are for tx query performance optimization
     async fn persist_transaction_index_tables(

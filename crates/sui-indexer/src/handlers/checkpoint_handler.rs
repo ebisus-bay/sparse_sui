@@ -315,6 +315,7 @@ where
                     );
 
                 // Persist seashrine listing events.
+                let indexer_config_c = indexer_config.clone();
                 let events_handler = self.clone();
                 spawn_monitored_task!(async move {
                     let mut event_commit_res = events_handler
@@ -323,7 +324,7 @@ where
                             create_listings.clone(),
                             update_listings.clone(),
                             buy_listings.clone(),
-                            indexer_config.clone(),
+                            indexer_config_c.clone(),
                         )
                         .await;
                     while let Err(e) = event_commit_res {
@@ -341,7 +342,7 @@ where
                                 create_listings.clone(),
                                 update_listings.clone(),
                                 buy_listings.clone(),
-                                indexer_config.clone(),
+                                indexer_config_c.clone(),
                             )
                             .await;
                     }
@@ -377,7 +378,10 @@ where
                 // NOTE: retrials are necessary here, otherwise results can be popped and discarded.
                 let events_handler = self.clone();
                 spawn_monitored_task!(async move {
-                    let mut event_commit_res = events_handler.state.persist_events(&events).await;
+                    let mut event_commit_res = events_handler
+                        .state
+                        .persist_events(&events, checkpoint_seq)
+                        .await;
                     while let Err(e) = event_commit_res {
                         warn!(
                             "Indexer event commit failed with error: {:?}, retrying after {:?} milli-secs...",
@@ -387,7 +391,10 @@ where
                             DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
                         ))
                         .await;
-                        event_commit_res = events_handler.state.persist_events(&events).await;
+                        event_commit_res = events_handler
+                            .state
+                            .persist_events(&events, checkpoint_seq)
+                            .await;
                     }
                 });
 

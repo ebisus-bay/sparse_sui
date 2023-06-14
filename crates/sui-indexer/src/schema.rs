@@ -107,6 +107,10 @@ diesel::table! {
 diesel::table! {
     dynamic_indexing_events (event_type) {
         event_type -> Text,
+        sequence_number -> Int8,
+        upto -> Int8,
+        picked -> Bool,
+        chunk_id -> Nullable<Text>,
     }
 }
 

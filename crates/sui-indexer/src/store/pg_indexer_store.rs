@@ -47,6 +47,7 @@ use sui_types::messages_checkpoint::{
     CheckpointCommitment, CheckpointSequenceNumber, ECMHLiveObjectSetDigest, EndOfEpochData,
 };
 use sui_types::object::ObjectRead;
+use ulid::Ulid;
 
 use crate::apis::seashrine_api::{
     CollectionPage, CollectionStructure, DisplayObjectStructure, DisplayObjectsPage, ListingPage,
@@ -59,7 +60,7 @@ use crate::models::checkpoints::Checkpoint;
 use crate::models::collection::{
     BpsRoyaltyStrategy, Collection, CollectionObject, MintCap, Supply,
 };
-use crate::models::dynamic_indexing::should_index_event_type;
+use crate::models::dynamic_indexing::{should_index_event_type, DynamicIndexingEvent};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
 use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
@@ -71,6 +72,7 @@ use crate::models::packages::Package;
 use crate::models::system_state::DBValidatorSummary;
 use crate::models::transaction_index::{InputObject, MoveCall, Recipient};
 use crate::models::transactions::Transaction;
+use crate::schema::checkpoints::sequence_number;
 use crate::schema::{
     self, active_addresses, address_stats, addresses, checkpoints, collections, display_objects,
     dynamic_indexing_events, epochs, events, input_objects, move_calls, objects, objects_history,
@@ -1963,7 +1965,7 @@ WHERE e1.epoch = e2.epoch
         .context("Failed while getting event type from `dynamic_indexing_events`")
     }
 
-    async fn persist_events(&self, events: &[Event]) -> Result<(), IndexerError> {
+    async fn persist_events(&self, events: &[Event], seq_number: i64) -> Result<(), IndexerError> {
         transactional_blocking!(&self.blocking_cp, |conn| {
             // Delete all the records from `events` whose `event_type` doesn't exists in the `dynamic_indexing_events`.
             // WHY: To sync deleted events from `dynamic_indexing_events` to `events`.
@@ -1972,6 +1974,24 @@ WHERE e1.epoch = e2.epoch
                     dynamic_indexing_events::table.select(dynamic_indexing_events::event_type),
                 )))
                 .execute(conn)?;
+
+            // Get all the events whose
+            let events_to_index: Vec<DynamicIndexingEvent> = dynamic_indexing_events::table
+                .filter(dynamic_indexing_events::picked.eq(false))
+                .load::<DynamicIndexingEvent>(conn)?;
+
+            // Set the current sequence number, set the flag to true and spawn a thread.
+            let uuid = Ulid::new().to_string();
+            diesel::update(dynamic_indexing_events::table)
+                .filter(dynamic_indexing_events::picked.eq(false))
+                .set((
+                    dynamic_indexing_events::picked.eq(true),
+                    dynamic_indexing_events::upto.eq(seq_number),
+                    dynamic_indexing_events::chunk_id.eq(Some(uuid)),
+                ))
+                .execute(conn)?;
+
+            // Spawn threads for `events_to_index` to index from 0..upto.
 
             let events = events
                 .into_iter()

@@ -9,7 +9,7 @@ mod module_resolver;
 mod pg_indexer_store;
 mod query;
 
-mod diesel_marco {
+pub mod diesel_marco {
     macro_rules! read_only_blocking {
         ($pool:expr, $query:expr) => {{
             let mut pg_pool_conn = crate::get_pg_pool_connection($pool)?;

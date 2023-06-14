@@ -7,8 +7,12 @@ use diesel::{
 
 #[derive(Queryable, Insertable, Debug, Clone, Selectable)]
 #[diesel(table_name = dynamic_indexing_events)]
-struct DynamicIndexingEvents {
-    event_type: String,
+pub struct DynamicIndexingEvent {
+    pub event_type: String,
+    pub sequence_number: i64,
+    pub upto: i64,
+    pub picked: bool,
+    pub chunk_id: Option<String>,
 }
 
 pub fn should_index_event_type(
