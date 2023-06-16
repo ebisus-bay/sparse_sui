@@ -17,11 +17,11 @@ use sui_indexer::models::checkpoints::Checkpoint;
 use sui_indexer::models::objects::{NamedBcsBytes, Object as DBObject, ObjectStatus};
 use sui_indexer::models::owners::OwnerType;
 use sui_indexer::models::transactions::Transaction;
-use sui_indexer::new_pg_connection_pool;
 use sui_indexer::store::{
     IndexerStore, PgIndexerStore, TemporaryCheckpointStore, TransactionObjectChanges,
 };
 use sui_indexer::utils::reset_database;
+use sui_indexer::{new_pg_connection_pool, IndexerConfig};
 use sui_json_rpc_types::CheckpointId;
 use sui_types::base_types::{ObjectDigest, ObjectID, SequenceNumber, SuiAddress};
 use sui_types::crypto::AggregateAuthoritySignature;
@@ -44,7 +44,8 @@ fn indexer_benchmark(c: &mut Criterion) {
         let registry = Registry::default();
         let indexer_metrics = IndexerMetrics::new(&registry);
 
-        let store = PgIndexerStore::new(blocking_cp, indexer_metrics).await;
+        let store =
+            PgIndexerStore::new(blocking_cp, indexer_metrics, IndexerConfig::default()).await;
 
         let checkpoints = (0..150).map(create_checkpoint).collect::<Vec<_>>();
         (checkpoints, store)

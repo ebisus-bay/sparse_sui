@@ -32,11 +32,11 @@ use sui_types::sui_system_state::{get_sui_system_state, SuiSystemStateTrait};
 use sui_types::transaction::SenderSignedData;
 use sui_types::SUI_SYSTEM_ADDRESS;
 
-use crate::models::checkpoints::Checkpoint;
 use crate::models::epoch::{DBEpochInfo, SystemEpochInfoEvent};
 use crate::models::objects::{DeletedObject, Object, ObjectStatus};
 use crate::models::packages::Package;
 use crate::models::transactions::Transaction;
+use crate::models::{checkpoints::Checkpoint, listing::IndexerModuleConfigCache};
 use crate::store::{
     CheckpointData, IndexerStore, TemporaryCheckpointStore, TemporaryEpochStore,
     TransactionObjectChanges,
@@ -96,6 +96,7 @@ where
     pub fn spawn(self) -> JoinHandle<()> {
         info!("Indexer checkpoint handler started...");
         let download_handler = self.clone();
+        let indexer_config = IndexerModuleConfig::parse();
         spawn_monitored_task!(async move {
             let mut checkpoint_download_index_res =
                 download_handler.start_download_and_index().await;
@@ -113,9 +114,11 @@ where
         });
 
         let checkpoint_commit_handler = self.clone();
+        let imc = indexer_config.clone();
         spawn_monitored_task!(async move {
-            let mut checkpoint_commit_res =
-                checkpoint_commit_handler.start_checkpoint_commit().await;
+            let mut checkpoint_commit_res = checkpoint_commit_handler
+                .start_checkpoint_commit(imc.clone())
+                .await;
             while let Err(e) = &checkpoint_commit_res {
                 warn!(
                     "Indexer checkpoint commit failed with error: {:?}, retrying after {:?} secs...",
@@ -125,7 +128,9 @@ where
                     DOWNLOAD_RETRY_INTERVAL_IN_SECS,
                 ))
                 .await;
-                checkpoint_commit_res = checkpoint_commit_handler.start_checkpoint_commit().await;
+                checkpoint_commit_res = checkpoint_commit_handler
+                    .start_checkpoint_commit(imc.clone())
+                    .await;
             }
         });
 
@@ -277,7 +282,10 @@ where
         }
     }
 
-    async fn start_checkpoint_commit(&self) -> Result<(), IndexerError> {
+    async fn start_checkpoint_commit(
+        &self,
+        indexer_config: IndexerModuleConfig,
+    ) -> Result<(), IndexerError> {
         info!("Indexer checkpoint commit task started...");
         loop {
             let mut checkpoint_receiver_guard = self.checkpoint_receiver.lock().await;
@@ -292,8 +300,6 @@ where
                     );
                     continue;
                 }
-
-                let indexer_config = IndexerModuleConfig::parse();
 
                 // Write checkpoint to DB
                 let TemporaryCheckpointStore {
@@ -351,10 +357,11 @@ where
                 // Persist collection objects
                 let collection_object_handler = self.clone();
                 let cloned_object_changes = object_changes.clone();
+                let imc = indexer_config.clone();
                 spawn_monitored_task!(async move {
                     let mut collection_changes_commit_res = collection_object_handler
                         .state
-                        .persist_collection_changes(&cloned_object_changes, indexer_config.clone())
+                        .persist_collection_changes(&cloned_object_changes, imc.clone())
                         .await;
                     while let Err(e) = collection_changes_commit_res {
                         warn!(
@@ -367,10 +374,7 @@ where
                         .await;
                         collection_changes_commit_res = collection_object_handler
                             .state
-                            .persist_collection_changes(
-                                &cloned_object_changes,
-                                indexer_config.clone(),
-                            )
+                            .persist_collection_changes(&cloned_object_changes, imc.clone())
                             .await;
                     }
                 });

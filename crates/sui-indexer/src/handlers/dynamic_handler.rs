@@ -7,7 +7,8 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use tokio::task::JoinHandle;
 use tracing::log::warn;
 
-use crate::schema::dynamic_indexing_events;
+use crate::models::events::Event;
+use crate::schema::{dynamic_indexing_events, events};
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
 use crate::store::CheckpointData;
 use crate::utils::multi_get_full_transactions;
@@ -20,7 +21,11 @@ use diesel::prelude::*;
 
 use super::checkpoint_handler::{fetch_changed_objects, get_object_changes};
 
-struct DynamicHandler {
+const MAX_EVENT_PAGE_SIZE: usize = 1000;
+const PG_COMMIT_CHUNK_SIZE: usize = 1000;
+const MAX_PARALLEL_DOWNLOADS: usize = 24;
+
+pub struct DynamicHandler {
     http_client: HttpClient,
     blocking_cp: PgConnectionPool,
     events_to_index: Vec<DynamicIndexingEvent>,
@@ -44,6 +49,7 @@ impl DynamicHandler {
 
     pub fn spawn(self) -> Result<(), IndexerError> {
         spawn_monitored_task!(async move {
+            println!("Starting reindexing for events.");
             let mut events_reindexing_response = self.start_reindexing_for_events().await;
             while let Err(e) = &events_reindexing_response {
                 warn!("Issue while reindexing events.");
@@ -63,6 +69,34 @@ impl DynamicHandler {
                 .map(|o| o.unwrap_or(-1))
         })
         .context("Failed to get sequence number for the chunk")
+    }
+
+    async fn insert_events(&self, events: &[Event]) -> Result<(), IndexerError> {
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            for event_chunk in events.chunks(PG_COMMIT_CHUNK_SIZE) {
+                diesel::insert_into(events::table)
+                    .values(event_chunk)
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .map_err(IndexerError::from)
+                    .context("Failed writing events to PostgresDB")?;
+            }
+            Ok::<(), IndexerError>(())
+        })
+        .context("Failed to insert events")
+    }
+
+    async fn update_sequence_number(&self, seq_no: i64) -> Result<(), IndexerError> {
+        // Update the sequence number for the `chunk_id` in the `dynamic_indexing_events` table.
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            diesel::update(dynamic_indexing_events::table)
+                .filter(dynamic_indexing_events::chunk_id.eq(self.chunk_id.clone()))
+                .set(dynamic_indexing_events::sequence_number.eq(seq_no))
+                .execute(conn)
+                .map_err(IndexerError::from)
+                .context("Failed updating sequence number for chunk")?;
+            Ok::<(), IndexerError>(())
+        })
     }
 
     async fn download_checkpoint_data(
@@ -115,6 +149,11 @@ impl DynamicHandler {
         let changed_objects =
             fetch_changed_objects(self.http_client.clone(), object_changes).await?;
 
+        // println!(
+        //     "Downloaded checkpoint: {:?}, {:?}",
+        //     &checkpoint, &changed_objects
+        // );
+
         Ok(CheckpointData {
             checkpoint,
             transactions,
@@ -122,13 +161,82 @@ impl DynamicHandler {
         })
     }
 
+    fn get_events_from_checkpointdata(checkpoint_data: &CheckpointData) -> Vec<Event> {
+        let CheckpointData {
+            checkpoint: _,
+            transactions,
+            changed_objects: _,
+        } = checkpoint_data;
+
+        transactions
+            .iter()
+            .flat_map(|tx| tx.events.data.iter().map(move |event| event.clone().into()))
+            .collect::<Vec<_>>()
+    }
+
     async fn start_reindexing_for_events(&self) -> Result<(), IndexerError> {
         let last_sequence_number = self.get_last_sequence_number().await?;
-        let mut current_parallel_downloads = 24;
-        loop {
-            // Download
-            // let download_futures
+        let mut current_parallel_downloads = MAX_PARALLEL_DOWNLOADS;
+        let mut next_cursor_sequence_number = last_sequence_number + 1;
+
+        // loop {
+        let download_futures = (next_cursor_sequence_number
+            ..(next_cursor_sequence_number + current_parallel_downloads as i64))
+            .map(|seq| self.download_checkpoint_data(seq as u64));
+        println!("Waiting for join_all");
+        let download_results = join_all(download_futures).await;
+
+        let mut downloaded_checkpoints = vec![];
+        next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
+
+        for download_result in download_results {
+            if let Ok(checkpoint) = download_result {
+                downloaded_checkpoints.push(checkpoint);
+            } else {
+                if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) = download_result {
+                    warn!(
+                        "Unexpected response from fullnode for checkpoints: {}",
+                        fn_e
+                    );
+                } else if let Err(IndexerError::FullNodeReadingError(fn_e)) = download_result {
+                    warn!("Fullnode reading error for checkpoints {}: {}. It can be transient or due to rate limiting.", next_cursor_sequence_number, fn_e);
+                } else {
+                    warn!("Error downloading checkpoints: {:?}", download_result);
+                }
+                break;
+            }
         }
+
+        current_parallel_downloads =
+            std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
+
+        if downloaded_checkpoints.is_empty() {
+            warn!(
+                "No checkpoints were downloaded for sequence number {}, retrying...",
+                next_cursor_sequence_number
+            );
+            // continue;
+        }
+
+        for checkpoint in downloaded_checkpoints {
+            let events = Self::get_events_from_checkpointdata(&checkpoint);
+            let filtered_events = events
+                .into_iter()
+                .filter(|event| {
+                    self.events_to_index
+                        .iter()
+                        .any(|e| e.event_type == event.event_type)
+                })
+                .collect::<Vec<_>>();
+
+            // Save the events
+            self.insert_events(filtered_events.as_slice()).await?;
+        }
+
+        // Increase the indexed sequence number in the `dynamic_indexing_events` table.
+        self.update_sequence_number(last_sequence_number + current_parallel_downloads as i64)
+            .await?;
+
         Ok(())
     }
 }

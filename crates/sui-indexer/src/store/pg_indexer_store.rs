@@ -54,6 +54,7 @@ use crate::apis::seashrine_api::{
     ListingStructure, NftFilter,
 };
 use crate::errors::{Context, IndexerError};
+use crate::handlers::dynamic_handler::DynamicHandler;
 use crate::metrics::IndexerMetrics;
 use crate::models::addresses::{ActiveAddress, Address, AddressStats, DBAddressStats};
 use crate::models::checkpoints::Checkpoint;
@@ -63,7 +64,9 @@ use crate::models::collection::{
 use crate::models::dynamic_indexing::{should_index_event_type, DynamicIndexingEvent};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
-use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
+use crate::models::listing::{
+    DisplayObject, IndexerModuleConfig, IndexerModuleConfigCache, Listing,
+};
 use crate::models::network_metrics::{DBMoveCallMetrics, DBNetworkMetrics};
 use crate::models::objects::{
     compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
@@ -85,7 +88,7 @@ use crate::store::query::DBFilter;
 use crate::store::TransactionObjectChanges;
 use crate::store::{IndexerStore, TemporaryEpochStore};
 use crate::utils::{get_balance_changes_from_effect, get_object_changes};
-use crate::{get_pg_pool_connection, PgConnectionPool};
+use crate::{get_http_client, get_pg_pool_connection, IndexerConfig, PgConnectionPool};
 
 const MAX_EVENT_PAGE_SIZE: usize = 1000;
 const PG_COMMIT_CHUNK_SIZE: usize = 1000;
@@ -116,10 +119,15 @@ pub struct PgIndexerStore {
     partition_manager: PartitionManager,
     module_cache: Arc<SyncModuleCache<IndexerModuleResolver>>,
     metrics: IndexerMetrics,
+    indexer_config: IndexerConfig,
 }
 
 impl PgIndexerStore {
-    pub async fn new(blocking_cp: PgConnectionPool, metrics: IndexerMetrics) -> Self {
+    pub async fn new(
+        blocking_cp: PgConnectionPool,
+        metrics: IndexerMetrics,
+        indexer_config: IndexerConfig,
+    ) -> Self {
         let module_cache = Arc::new(SyncModuleCache::new(IndexerModuleResolver::new(
             blocking_cp.clone(),
         )));
@@ -128,6 +136,7 @@ impl PgIndexerStore {
             partition_manager: PartitionManager::new(blocking_cp).await.unwrap(),
             module_cache,
             metrics,
+            indexer_config,
         }
     }
 
@@ -717,12 +726,11 @@ impl IndexerStore for PgIndexerStore {
     async fn persist_collection_changes(
         &self,
         transaction_object_changes: &Vec<TransactionObjectChanges>,
-        indexer_store: IndexerModuleConfig,
+        indexer_config: IndexerModuleConfig,
     ) -> Result<(), IndexerError> {
         use crate::schema::collections::dsl::*;
 
         // TODO: Not parse everywhere.
-        let indexer_config = IndexerModuleConfig::parse();
 
         transactional_blocking!(&self.blocking_cp, |conn| {
             // Get all the mutated objects
@@ -1987,11 +1995,20 @@ WHERE e1.epoch = e2.epoch
                 .set((
                     dynamic_indexing_events::picked.eq(true),
                     dynamic_indexing_events::upto.eq(seq_number),
-                    dynamic_indexing_events::chunk_id.eq(Some(uuid)),
+                    dynamic_indexing_events::chunk_id.eq(Some(uuid.clone())),
                 ))
                 .execute(conn)?;
 
-            // Spawn threads for `events_to_index` to index from 0..upto.
+            if !events_to_index.is_empty() {
+                // Spawn threads for `events_to_index` to index from 0..upto.
+                let dynamic_handler = DynamicHandler::new(
+                    get_http_client(self.indexer_config.rpc_client_url.as_str())?,
+                    events_to_index,
+                    uuid,
+                    self.blocking_cp.clone(),
+                );
+                dynamic_handler.spawn()?;
+            }
 
             let events = events
                 .into_iter()
