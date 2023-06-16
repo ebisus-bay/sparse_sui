@@ -5,6 +5,7 @@ use mysten_metrics::spawn_monitored_task;
 use sui_json_rpc::api::ReadApiClient;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use tokio::task::JoinHandle;
+use tracing::info;
 use tracing::log::warn;
 
 use crate::models::events::Event;
@@ -99,6 +100,17 @@ impl DynamicHandler {
         })
     }
 
+    fn get_upto(&self) -> Result<i64, IndexerError> {
+        read_only_blocking!(&self.blocking_cp, |conn| {
+            dynamic_indexing_events::table
+                .filter(dynamic_indexing_events::chunk_id.eq(Some(self.chunk_id.clone())))
+                .select(diesel::dsl::max(dynamic_indexing_events::upto))
+                .first::<Option<i64>>(conn)
+                .map(|o| o.unwrap_or(-1))
+        })
+        .context("Failed to get upto for the chunk")
+    }
+
     async fn download_checkpoint_data(
         &self,
         seq: CheckpointSequenceNumber,
@@ -178,65 +190,79 @@ impl DynamicHandler {
         let last_sequence_number = self.get_last_sequence_number().await?;
         let mut current_parallel_downloads = MAX_PARALLEL_DOWNLOADS;
         let mut next_cursor_sequence_number = last_sequence_number + 1;
+        let upto = self.get_upto()?;
 
-        // loop {
-        let download_futures = (next_cursor_sequence_number
-            ..(next_cursor_sequence_number + current_parallel_downloads as i64))
-            .map(|seq| self.download_checkpoint_data(seq as u64));
-        println!("Waiting for join_all");
-        let download_results = join_all(download_futures).await;
-
-        let mut downloaded_checkpoints = vec![];
-        next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
-
-        for download_result in download_results {
-            if let Ok(checkpoint) = download_result {
-                downloaded_checkpoints.push(checkpoint);
-            } else {
-                if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) = download_result {
-                    warn!(
-                        "Unexpected response from fullnode for checkpoints: {}",
-                        fn_e
-                    );
-                } else if let Err(IndexerError::FullNodeReadingError(fn_e)) = download_result {
-                    warn!("Fullnode reading error for checkpoints {}: {}. It can be transient or due to rate limiting.", next_cursor_sequence_number, fn_e);
-                } else {
-                    warn!("Error downloading checkpoints: {:?}", download_result);
-                }
-                break;
-            }
-        }
-
-        current_parallel_downloads =
-            std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
-
-        if downloaded_checkpoints.is_empty() {
-            warn!(
-                "No checkpoints were downloaded for sequence number {}, retrying...",
-                next_cursor_sequence_number
+        // Iterate until we reach the `upto`.
+        while next_cursor_sequence_number < upto {
+            info!(
+                "DynamicHandler: (Upto: {}) Downloading checkpoints from sequence number {} to {}.",
+                upto,
+                next_cursor_sequence_number,
+                next_cursor_sequence_number + current_parallel_downloads as i64
             );
-            // continue;
+            let download_futures = (next_cursor_sequence_number
+                ..(next_cursor_sequence_number + current_parallel_downloads as i64))
+                .map(|seq| self.download_checkpoint_data(seq as u64));
+            let download_results = join_all(download_futures).await;
+
+            let mut downloaded_checkpoints = vec![];
+            next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
+
+            for download_result in download_results {
+                if let Ok(checkpoint) = download_result {
+                    downloaded_checkpoints.push(checkpoint);
+                } else {
+                    if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) =
+                        download_result
+                    {
+                        warn!(
+                            "Unexpected response from fullnode for checkpoints: {}",
+                            fn_e
+                        );
+                    } else if let Err(IndexerError::FullNodeReadingError(fn_e)) = download_result {
+                        warn!("Fullnode reading error for checkpoints {}: {}. It can be transient or due to rate limiting.", next_cursor_sequence_number, fn_e);
+                    } else {
+                        warn!("Error downloading checkpoints: {:?}", download_result);
+                    }
+                    break;
+                }
+            }
+
+            next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
+            current_parallel_downloads =
+                std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
+
+            if downloaded_checkpoints.is_empty() {
+                warn!(
+                    "No checkpoints were downloaded for sequence number {}, retrying...",
+                    next_cursor_sequence_number
+                );
+                // continue;
+            }
+
+            for checkpoint in downloaded_checkpoints {
+                let events = Self::get_events_from_checkpointdata(&checkpoint);
+                let filtered_events = events
+                    .into_iter()
+                    .filter(|event| {
+                        self.events_to_index
+                            .iter()
+                            .any(|e| e.event_type == event.event_type)
+                    })
+                    .collect::<Vec<_>>();
+
+                // Save the events
+                self.insert_events(filtered_events.as_slice()).await?;
+            }
+
+            // Increase the indexed sequence number in the `dynamic_indexing_events` table.
+            self.update_sequence_number(next_cursor_sequence_number)
+                .await?;
         }
-
-        for checkpoint in downloaded_checkpoints {
-            let events = Self::get_events_from_checkpointdata(&checkpoint);
-            let filtered_events = events
-                .into_iter()
-                .filter(|event| {
-                    self.events_to_index
-                        .iter()
-                        .any(|e| e.event_type == event.event_type)
-                })
-                .collect::<Vec<_>>();
-
-            // Save the events
-            self.insert_events(filtered_events.as_slice()).await?;
-        }
-
-        // Increase the indexed sequence number in the `dynamic_indexing_events` table.
-        self.update_sequence_number(last_sequence_number + current_parallel_downloads as i64)
-            .await?;
-
+        info!(
+            "DynamicHandler: Finished reindexing for events for chunk: {}.",
+            self.chunk_id
+        );
         Ok(())
     }
 }
