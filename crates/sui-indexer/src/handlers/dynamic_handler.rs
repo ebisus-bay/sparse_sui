@@ -4,7 +4,6 @@ use jsonrpsee::http_client::HttpClient;
 use mysten_metrics::spawn_monitored_task;
 use sui_json_rpc::api::ReadApiClient;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
-use tokio::task::JoinHandle;
 use tracing::info;
 use tracing::log::warn;
 
@@ -22,7 +21,6 @@ use diesel::prelude::*;
 
 use super::checkpoint_handler::{fetch_changed_objects, get_object_changes};
 
-const MAX_EVENT_PAGE_SIZE: usize = 1000;
 const PG_COMMIT_CHUNK_SIZE: usize = 1000;
 const MAX_PARALLEL_DOWNLOADS: usize = 24;
 
@@ -52,7 +50,7 @@ impl DynamicHandler {
         spawn_monitored_task!(async move {
             println!("Starting reindexing for events.");
             let mut events_reindexing_response = self.start_reindexing_for_events().await;
-            while let Err(e) = &events_reindexing_response {
+            while let Err(_) = &events_reindexing_response {
                 warn!("Issue while reindexing events.");
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 events_reindexing_response = self.start_reindexing_for_events().await;

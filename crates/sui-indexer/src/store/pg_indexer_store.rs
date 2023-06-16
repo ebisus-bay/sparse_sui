@@ -64,9 +64,7 @@ use crate::models::collection::{
 use crate::models::dynamic_indexing::{should_index_event_type, DynamicIndexingEvent};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
-use crate::models::listing::{
-    DisplayObject, IndexerModuleConfig, IndexerModuleConfigCache, Listing,
-};
+use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
 use crate::models::network_metrics::{DBMoveCallMetrics, DBNetworkMetrics};
 use crate::models::objects::{
     compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
@@ -75,7 +73,6 @@ use crate::models::packages::Package;
 use crate::models::system_state::DBValidatorSummary;
 use crate::models::transaction_index::{InputObject, MoveCall, Recipient};
 use crate::models::transactions::Transaction;
-use crate::schema::checkpoints::sequence_number;
 use crate::schema::{
     self, active_addresses, address_stats, addresses, checkpoints, collections, display_objects,
     dynamic_indexing_events, epochs, events, input_objects, move_calls, objects, objects_history,
@@ -2514,10 +2511,11 @@ fn persist_transaction_object_changes(
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn get_move_value_type(val: &MoveValue) -> Option<StructTag> {
     let type_ = match val {
         MoveValue::Struct(move_struct) => match move_struct {
-            MoveStruct::WithTypes { type_, fields } => Some(type_.clone()),
+            MoveStruct::WithTypes { type_, fields: _ } => Some(type_.clone()),
             _ => None,
         },
         _ => None,
@@ -2533,6 +2531,7 @@ pub fn generate_re_for_type(object_id: String, type_: String) -> Result<Regex, r
     Regex::new(&full_type)
 }
 
+#[allow(dead_code)]
 pub fn generate_re_for_df(marker: String, display_info: String) -> Result<Regex, regex::Error> {
     // 0x2::dynamic_field::Field<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::utils::Marker<0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>, 0xe50e10d1f0b82d978f113675cdeeff686ff6133e4a53a07b880b62a6f0546dac::display_info::DisplayInfo>
     let full_type = format!(
@@ -2544,6 +2543,7 @@ pub fn generate_re_for_df(marker: String, display_info: String) -> Result<Regex,
     Regex::new(&full_type)
 }
 
+#[allow(dead_code)]
 pub fn does_object_exists(
     blocking_cp: &Pool<ConnectionManager<PgConnection>>,
     type_: String,
@@ -2572,20 +2572,21 @@ pub fn does_object_exists(
         .optional();
     let result = match object {
         Ok(optional_ob) => match optional_ob {
-            Some(val) => true,
+            Some(_) => true,
             None => false,
         },
-        Err(e) => false,
+        Err(_) => false,
     };
     result
 }
 
+#[allow(dead_code)]
 pub fn simple_fields_map(val: &MoveValue) -> HashMap<String, String> {
     let mut field_map: HashMap<String, String> = HashMap::new();
     let nft = val;
     match nft {
         MoveValue::Struct(move_struct) => match move_struct {
-            MoveStruct::WithTypes { type_, fields } => {
+            MoveStruct::WithTypes { type_: _, fields } => {
                 println!("Struct with types");
                 // Iterate over the fields of struct to parse string?
                 for field in fields.into_iter() {
@@ -2615,9 +2616,10 @@ pub fn simple_fields_map(val: &MoveValue) -> HashMap<String, String> {
     field_map
 }
 
+#[allow(dead_code)]
 pub fn is_string_struct(move_struct: &MoveStruct) -> bool {
     match move_struct {
-        MoveStruct::WithTypes { type_, fields } => {
+        MoveStruct::WithTypes { type_, fields: _ } => {
             if type_.address.to_canonical_string()
                 == "0000000000000000000000000000000000000000000000000000000000000001"
                 && (type_.module.clone().into_string() == "string"
@@ -2632,9 +2634,11 @@ pub fn is_string_struct(move_struct: &MoveStruct) -> bool {
         _ => false,
     }
 }
+
+#[allow(dead_code)]
 pub fn is_url_struct(move_struct: &MoveStruct) -> bool {
     match move_struct {
-        MoveStruct::WithTypes { type_, fields } => {
+        MoveStruct::WithTypes { type_, fields: _ } => {
             if type_.address.to_canonical_string()
                 == "0000000000000000000000000000000000000000000000000000000000000002"
                 && type_.module.clone().into_string() == "url"
@@ -2649,9 +2653,10 @@ pub fn is_url_struct(move_struct: &MoveStruct) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn resolve_url(move_struct: &MoveStruct) -> String {
     match move_struct {
-        MoveStruct::WithTypes { type_, fields } => {
+        MoveStruct::WithTypes { type_: _, fields } => {
             assert!(is_url_struct(move_struct) && fields.len() == 1);
             let val = &fields[0];
             match val.clone().1 {
@@ -2666,11 +2671,12 @@ pub fn resolve_url(move_struct: &MoveStruct) -> String {
 
 // fn resolve_move_struct(move_struct: &MoveStruct) -> HashMap<String, >
 
+#[allow(dead_code)]
 /// Convert the MoveStrcut for `0x1::string::String` into a rust String
 pub fn resolve_string(move_struct: &MoveStruct) -> String {
     assert!(is_string_struct(move_struct));
     match move_struct {
-        MoveStruct::WithTypes { type_, fields } => {
+        MoveStruct::WithTypes { type_: _, fields } => {
             assert!(fields.len() == 1);
             let val = &fields[0];
             assert!(val.clone().0.into_string() == "bytes");

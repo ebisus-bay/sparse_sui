@@ -221,28 +221,6 @@ impl IndexerModuleConfig {
     }
 }
 
-pub struct IndexerModuleConfigCache {
-    indexer_module_config: Option<IndexerModuleConfig>,
-}
-
-impl IndexerModuleConfigCache {
-    pub fn new() -> Self {
-        IndexerModuleConfigCache {
-            indexer_module_config: None,
-        }
-    }
-    pub fn get(&mut self) -> IndexerModuleConfig {
-        match &self.indexer_module_config {
-            Some(config) => config.clone(),
-            None => {
-                let config = IndexerModuleConfig::parse();
-                self.indexer_module_config = Some(config.clone());
-                config
-            }
-        }
-    }
-}
-
 impl Listing {
     /// Returns a set of CreateListingEvent, UpdateListingEvent, BuyListingEvent
     pub fn events_to_seashrine_listing_events(
