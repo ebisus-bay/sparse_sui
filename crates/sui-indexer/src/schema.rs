@@ -115,6 +115,16 @@ diesel::table! {
 }
 
 diesel::table! {
+    dynamic_indexing_objects (object_type) {
+        object_type -> Text,
+        sequence_number -> Int8,
+        upto -> Int8,
+        picked -> Bool,
+        chunk_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     epochs (epoch) {
         epoch -> Int8,
         first_checkpoint_id -> Int8,
@@ -382,6 +392,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     collections,
     display_objects,
     dynamic_indexing_events,
+    dynamic_indexing_objects,
     epochs,
     events,
     input_objects,

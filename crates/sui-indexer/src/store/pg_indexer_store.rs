@@ -61,7 +61,10 @@ use crate::models::checkpoints::Checkpoint;
 use crate::models::collection::{
     BpsRoyaltyStrategy, Collection, CollectionObject, MintCap, Supply,
 };
-use crate::models::dynamic_indexing::{should_index_event_type, DynamicIndexingEvent};
+use crate::models::dynamic_indexing::{
+    is_display_or_collection_type, should_index_event_type, should_index_object_type,
+    DynamicIndexingEvent,
+};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
 use crate::models::listing::{Display, DisplayObject, IndexerModuleConfig, Listing};
@@ -75,8 +78,9 @@ use crate::models::transaction_index::{InputObject, MoveCall, Recipient};
 use crate::models::transactions::Transaction;
 use crate::schema::{
     self, active_addresses, address_stats, addresses, checkpoints, collections, display_objects,
-    dynamic_indexing_events, epochs, events, input_objects, move_calls, objects, objects_history,
-    packages, recipients, seashrine_listing, system_states, transactions, validators,
+    dynamic_indexing_events, dynamic_indexing_objects, epochs, events, input_objects, move_calls,
+    objects, objects_history, packages, recipients, seashrine_listing, system_states, transactions,
+    validators,
 };
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
 use crate::store::indexer_store::TemporaryCheckpointStore;
@@ -1939,13 +1943,43 @@ WHERE e1.epoch = e2.epoch
                 .execute(conn)?;
 
             {
+                // Delete all records from `objects` table whose `object_type` is not in the `dynamic_indexing_objects`.
+                diesel::delete(objects::table)
+                    .filter(diesel::dsl::not(
+                        objects::object_type.eq_any(
+                            dynamic_indexing_objects::table
+                                .select(dynamic_indexing_objects::object_type),
+                        ),
+                    ))
+                    .execute(conn)?;
+
                 let mutated_objects: Vec<Object> = tx_object_changes
                     .iter()
                     .flat_map(|changes| changes.changed_objects.iter().cloned())
+                    .filter(|o| {
+                        let in_dynamic_table =
+                            should_index_object_type(&self.blocking_cp, o.object_type.clone());
+                        let is_display_or_collection = is_display_or_collection_type(
+                            o.object_type.clone().as_str(),
+                            &indexer_config,
+                        );
+
+                        in_dynamic_table || is_display_or_collection
+                    })
                     .collect();
                 let deleted_changes = tx_object_changes
                     .iter()
                     .flat_map(|changes| changes.deleted_objects.iter().cloned())
+                    .filter(|o| {
+                        let in_dynamic_table =
+                            should_index_object_type(&self.blocking_cp, o.object_type.clone());
+                        let is_display_or_collection = is_display_or_collection_type(
+                            o.object_type.clone().as_str(),
+                            &indexer_config,
+                        );
+
+                        in_dynamic_table || is_display_or_collection
+                    })
                     .collect::<Vec<_>>();
                 let deleted_objects: Vec<Object> = deleted_changes
                     .iter()
@@ -1975,27 +2009,26 @@ WHERE e1.epoch = e2.epoch
                         let obj_read = o.clone().try_into_object_read(&self.module_cache).unwrap();
 
                         match obj_read {
-                            ObjectRead::Exists(object_ref, obj, optional_move_struct) => {
-                                match obj.data {
-                                    sui_types::object::Data::Move(mv) => match optional_move_struct
-                                    {
-                                        Some(move_struct_type) => (
-                                            o.clone(),
-                                            MoveValue::simple_deserialize(
-                                                mv.contents(),
-                                                &sui_json::MoveTypeLayout::Struct(move_struct_type),
-                                            )
-                                            .unwrap(),
-                                        ),
-                                        None => {
-                                            panic!("Optional move struct is not there.")
-                                        }
-                                    },
-                                    _ => {
-                                        panic!("Move package found")
+                            ObjectRead::Exists(_object_ref, obj, optional_move_struct) => match obj
+                                .data
+                            {
+                                sui_types::object::Data::Move(mv) => match optional_move_struct {
+                                    Some(move_struct_type) => (
+                                        o.clone(),
+                                        MoveValue::simple_deserialize(
+                                            mv.contents(),
+                                            &sui_json::MoveTypeLayout::Struct(move_struct_type),
+                                        )
+                                        .unwrap(),
+                                    ),
+                                    None => {
+                                        panic!("Optional move struct is not there.")
                                     }
+                                },
+                                _ => {
+                                    panic!("Move package found")
                                 }
-                            }
+                            },
                             _ => {
                                 panic!("Object doesn't exists")
                             }
@@ -2152,7 +2185,7 @@ WHERE e1.epoch = e2.epoch
 
             if !events_to_index.is_empty() {
                 // Spawn threads for `events_to_index` to index from 0..upto.
-                let dynamic_handler = DynamicHandler::new(
+                let dynamic_handler = DynamicHandler::for_events(
                     get_http_client(self.indexer_config.rpc_client_url.as_str())?,
                     events_to_index,
                     uuid,
@@ -2676,7 +2709,6 @@ fn persist_transaction_object_changes(
     Ok(0)
 }
 
-#[allow(dead_code)]
 pub fn get_move_value_type(val: &MoveValue) -> Option<StructTag> {
     let type_ = match val {
         MoveValue::Struct(move_struct) => match move_struct {
@@ -2708,7 +2740,6 @@ pub fn generate_re_for_df(marker: String, display_info: String) -> Result<Regex,
     Regex::new(&full_type)
 }
 
-#[allow(dead_code)]
 pub fn does_object_exists(
     blocking_cp: &Pool<ConnectionManager<PgConnection>>,
     type_: String,
