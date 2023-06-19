@@ -64,7 +64,7 @@ use crate::models::collection::{
 use crate::models::dynamic_indexing::{should_index_event_type, DynamicIndexingEvent};
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
-use crate::models::listing::{DisplayObject, IndexerModuleConfig, Listing};
+use crate::models::listing::{Display, DisplayObject, IndexerModuleConfig, Listing};
 use crate::models::network_metrics::{DBMoveCallMetrics, DBNetworkMetrics};
 use crate::models::objects::{
     compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
@@ -1759,6 +1759,7 @@ impl IndexerStore for PgIndexerStore {
                 conn,
                 tx_object_changes.changed_objects,
                 deleted_objects,
+                Vec::new(),
                 None,
                 None,
             )
@@ -1822,7 +1823,14 @@ impl IndexerStore for PgIndexerStore {
                 .iter()
                 .map(|deleted_object| deleted_object.clone().into())
                 .collect();
-            persist_transaction_object_changes(conn, mutated_objects, deleted_objects, None, None)?;
+            persist_transaction_object_changes(
+                conn,
+                mutated_objects,
+                deleted_objects,
+                Vec::new(),
+                None,
+                None,
+            )?;
 
             // TODO(gegaowp): refactor to consolidate commit blocks
             // Commit indexed packages
@@ -1915,6 +1923,7 @@ impl IndexerStore for PgIndexerStore {
         tx_object_changes: &[TransactionObjectChanges],
         object_mutation_latency: Histogram,
         object_deletion_latency: Histogram,
+        indexer_config: IndexerModuleConfig,
     ) -> Result<(), IndexerError> {
         transactional_blocking!(&self.blocking_cp, |conn| {
             // update epoch transaction count
@@ -1942,10 +1951,155 @@ WHERE e1.epoch = e2.epoch
                     .iter()
                     .map(|deleted_object| deleted_object.clone().into())
                     .collect();
+
+                // Persist display objects
+
+                let mut display_objects: Vec<DisplayObject> = Vec::new();
+
+                let nfts: Vec<(Object, MoveValue)> = mutated_objects
+                    .clone()
+                    .into_iter()
+                    .filter(|o| {
+                        let display_type = format!("0x2::display::Display<{}>", o.object_type);
+                        let collection_type = format!(
+                            "{}::collection::Collection<{}>",
+                            indexer_config.collection_object, o.object_type
+                        );
+
+                        // An object is an NFT is it has a collection::Collection<T> for it.
+                        let is_collection = does_object_exists(&self.blocking_cp, collection_type);
+                        let is_display_object = does_object_exists(&self.blocking_cp, display_type);
+                        is_collection && is_display_object
+                    })
+                    .map(|o| {
+                        let obj_read = o.clone().try_into_object_read(&self.module_cache).unwrap();
+
+                        match obj_read {
+                            ObjectRead::Exists(object_ref, obj, optional_move_struct) => {
+                                match obj.data {
+                                    sui_types::object::Data::Move(mv) => match optional_move_struct
+                                    {
+                                        Some(move_struct_type) => (
+                                            o.clone(),
+                                            MoveValue::simple_deserialize(
+                                                mv.contents(),
+                                                &sui_json::MoveTypeLayout::Struct(move_struct_type),
+                                            )
+                                            .unwrap(),
+                                        ),
+                                        None => {
+                                            panic!("Optional move struct is not there.")
+                                        }
+                                    },
+                                    _ => {
+                                        panic!("Move package found")
+                                    }
+                                }
+                            }
+                            _ => {
+                                panic!("Object doesn't exists")
+                            }
+                        }
+                    })
+                    .collect();
+
+                if nfts.len() > 0 {
+                    println!("Deserializing structs on the fly: {:?}", nfts);
+                    let nft = &nfts[0].1;
+                    let nft_object = &nfts[0].0;
+
+                    let field_map = simple_fields_map(nft);
+                    let type_ = get_move_value_type(nft).unwrap();
+                    let object_type =
+                        format!("0x{}::{}::{}", type_.address, type_.module, type_.name);
+                    let display_type = format!("0x2::display::Display<{}>", object_type);
+
+                    // MUSTFIX (jian): add display field error support on implementation
+                    let object: Result<Option<Object>, IndexerError> =
+                        read_only_blocking!(&self.blocking_cp, |conn| {
+                            objects::dsl::objects
+                                .select((
+                                    objects::epoch,
+                                    objects::checkpoint,
+                                    objects::object_id,
+                                    objects::version,
+                                    objects::object_digest,
+                                    objects::owner_type,
+                                    objects::owner_address,
+                                    objects::initial_shared_version,
+                                    objects::previous_transaction,
+                                    objects::object_type,
+                                    objects::object_status,
+                                    objects::has_public_transfer,
+                                    objects::storage_rebate,
+                                    objects::bcs,
+                                ))
+                                .filter(objects::object_type.eq(display_type))
+                                .first::<Object>(conn)
+                                .optional()
+                        });
+
+                    match object.unwrap() {
+                        Some(ob) => {
+                            let display_obj: Display =
+                                bcs::from_bytes(ob.bcs[0].1.as_slice()).unwrap();
+                            let mut display_fields = display_obj.into_hashmap();
+                            println!("Display Fields: {:?}", display_fields);
+                            for (_, value) in display_fields.iter_mut() {
+                                let pattern = Regex::new(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}").unwrap();
+                                let potential_key = &pattern.captures(value).unwrap();
+                                if potential_key.len() > 0 {
+                                    let p_key = &potential_key[1];
+                                    println!("P_key: {:?}", p_key);
+                                    if field_map.contains_key(p_key) {
+                                        let new_val = value.replace(
+                                            &format!("{{{}}}", p_key),
+                                            field_map.get(p_key).unwrap(),
+                                        );
+                                        value.clear();
+                                        value.push_str(new_val.as_str());
+                                    } else {
+                                        value.clear();
+                                    }
+                                }
+                            }
+                            println!("Replaces Display Map {:?}", display_fields);
+                            let e = String::from("");
+                            display_objects.push(DisplayObject {
+                                object_id: nft_object.object_id.clone(),
+                                object_type: nft_object.object_type.clone(),
+                                owner_address: ob.owner_address,
+                                name: display_fields.get("name").unwrap_or_else(|| &e).clone(),
+                                link: display_fields.get("link").unwrap_or_else(|| &e).clone(),
+                                description: display_fields
+                                    .get("description")
+                                    .unwrap_or_else(|| &e)
+                                    .clone(),
+                                project_url: display_fields
+                                    .get("project_url")
+                                    .unwrap_or_else(|| &e)
+                                    .clone(),
+                                creator: display_fields
+                                    .get("creator")
+                                    .unwrap_or_else(|| &e)
+                                    .clone(),
+                                image_url: display_fields
+                                    .get("image_url")
+                                    .unwrap_or_else(|| &e)
+                                    .clone(),
+                            });
+                        }
+                        None => {}
+                    }
+
+                    println!("Parsed map: {:?}", field_map);
+                }
+
                 persist_transaction_object_changes(
                     conn,
                     mutated_objects,
                     deleted_objects,
+                    display_objects,
                     Some(object_mutation_latency),
                     Some(object_deletion_latency),
                 )?;
@@ -2406,6 +2560,7 @@ fn persist_transaction_object_changes(
     conn: &mut PgConnection,
     mutated_objects: Vec<Object>,
     deleted_objects: Vec<Object>,
+    display_objects: Vec<DisplayObject>,
     object_mutation_latency: Option<Histogram>,
     object_deletion_latency: Option<Histogram>,
 ) -> Result<usize, IndexerError> {
@@ -2460,6 +2615,16 @@ fn persist_transaction_object_changes(
                     ))
                 })?;
         }
+    }
+
+    // Save the objects from their Display<T> into the database
+    for event_chunk in display_objects.chunks(PG_COMMIT_CHUNK_SIZE) {
+        diesel::insert_into(display_objects::table)
+            .values(event_chunk)
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .map_err(IndexerError::from)
+            .context("Failed writing events to PostgresDB")?;
     }
 
     // MUSTFIX(gegaowp): clean up the metrics codes after experiment

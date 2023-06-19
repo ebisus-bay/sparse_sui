@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub struct SeashrineApi<S> {
+    #[allow(dead_code)]
     fullnode: HttpClient,
     state: S,
 }

@@ -421,6 +421,7 @@ where
                 });
 
                 let tx_index_table_handler = self.clone();
+                let imc = indexer_config.clone();
                 spawn_monitored_task!(async move {
                     let mut transaction_index_tables_commit_res = tx_index_table_handler
                         .state
@@ -494,6 +495,7 @@ where
                         &object_changes,
                         self.metrics.object_mutation_db_commit_latency.clone(),
                         self.metrics.object_deletion_db_commit_latency.clone(),
+                        imc.clone(),
                     )
                     .await;
                 while let Err(e) = object_changes_commit_res {
@@ -512,6 +514,7 @@ where
                             &object_changes,
                             self.metrics.object_mutation_db_commit_latency.clone(),
                             self.metrics.object_deletion_db_commit_latency.clone(),
+                            imc.clone(),
                         )
                         .await;
                 }

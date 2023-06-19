@@ -270,6 +270,7 @@ pub trait IndexerStore {
         tx_object_changes: &[TransactionObjectChanges],
         object_mutation_latency: Histogram,
         object_deletion_latency: Histogram,
+        indexer_config: IndexerModuleConfig,
     ) -> Result<(), IndexerError>;
 
     async fn event_type_exists(&self, event_type: String) -> Result<bool, IndexerError>;
