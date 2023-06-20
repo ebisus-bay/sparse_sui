@@ -63,7 +63,7 @@ use crate::models::collection::{
 };
 use crate::models::dynamic_indexing::{
     is_display_or_collection_type, should_index_event_type, should_index_object_type,
-    DynamicIndexingEvent,
+    DynamicIndexingEvent, DynamicIndexingObject,
 };
 use crate::models::epoch::DBEpochInfo;
 use crate::models::events::Event;
@@ -1928,6 +1928,7 @@ impl IndexerStore for PgIndexerStore {
         object_mutation_latency: Histogram,
         object_deletion_latency: Histogram,
         indexer_config: IndexerModuleConfig,
+        seq_number: i64,
     ) -> Result<(), IndexerError> {
         transactional_blocking!(&self.blocking_cp, |conn| {
             // update epoch transaction count
@@ -1952,6 +1953,33 @@ WHERE e1.epoch = e2.epoch
                         ),
                     ))
                     .execute(conn)?;
+
+                // Get all the objects which aren't picked yet
+                let objects_to_index: Vec<DynamicIndexingObject> = dynamic_indexing_objects::table
+                    .filter(dynamic_indexing_objects::picked.eq(false))
+                    .load::<DynamicIndexingObject>(conn)?;
+
+                // Set the current sequence number, set the flag to true and spawn a thread.
+                let uuid = Ulid::new().to_string();
+                diesel::update(dynamic_indexing_objects::table)
+                    .filter(dynamic_indexing_objects::picked.eq(false))
+                    .set((
+                        dynamic_indexing_objects::picked.eq(true),
+                        dynamic_indexing_objects::upto.eq(seq_number),
+                        dynamic_indexing_objects::chunk_id.eq(Some(uuid.clone())),
+                    ))
+                    .execute(conn)?;
+
+                if !objects_to_index.is_empty() {
+                    // Spawn threads for `objects_to_index` to index from 0..upto.
+                    let dynamic_handler = DynamicHandler::for_objects(
+                        get_http_client(self.indexer_config.rpc_client_url.as_str())?,
+                        objects_to_index,
+                        uuid,
+                        self.blocking_cp.clone(),
+                    );
+                    dynamic_handler.spawn()?;
+                }
 
                 let mutated_objects: Vec<Object> = tx_object_changes
                     .iter()

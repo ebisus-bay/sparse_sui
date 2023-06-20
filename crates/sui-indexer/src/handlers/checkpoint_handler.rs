@@ -496,6 +496,7 @@ where
                         self.metrics.object_mutation_db_commit_latency.clone(),
                         self.metrics.object_deletion_db_commit_latency.clone(),
                         imc.clone(),
+                        checkpoint_seq,
                     )
                     .await;
                 while let Err(e) = object_changes_commit_res {
@@ -515,6 +516,7 @@ where
                             self.metrics.object_mutation_db_commit_latency.clone(),
                             self.metrics.object_deletion_db_commit_latency.clone(),
                             imc.clone(),
+                            checkpoint_seq,
                         )
                         .await;
                 }

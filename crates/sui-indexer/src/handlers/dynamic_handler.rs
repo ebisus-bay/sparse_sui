@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use diesel::QueryDsl;
 use futures::future::join_all;
 use jsonrpsee::http_client::HttpClient;
@@ -7,12 +9,18 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use tracing::info;
 use tracing::log::warn;
 
+use super::checkpoint_handler::{
+    fetch_changed_objects, get_deleted_db_objects, get_object_changes,
+};
 use crate::models::dynamic_indexing::DynamicIndexingObject;
 use crate::models::events::Event;
+use crate::models::objects::{
+    compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
+};
 use crate::schema::checkpoints::sequence_number;
-use crate::schema::{dynamic_indexing_events, dynamic_indexing_objects, events};
+use crate::schema::{dynamic_indexing_events, dynamic_indexing_objects, events, objects};
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
-use crate::store::CheckpointData;
+use crate::store::{CheckpointData, TransactionObjectChanges};
 use crate::utils::multi_get_full_transactions;
 use crate::{
     errors::{Context, IndexerError},
@@ -20,8 +28,7 @@ use crate::{
     PgConnectionPool,
 };
 use diesel::prelude::*;
-
-use super::checkpoint_handler::{fetch_changed_objects, get_object_changes};
+use diesel::upsert::excluded;
 
 const PG_COMMIT_CHUNK_SIZE: usize = 1000;
 const MAX_PARALLEL_DOWNLOADS: usize = 24;
@@ -48,6 +55,20 @@ impl DynamicHandler {
         Self {
             http_client,
             data: DynamicIndexingData::Events(events_to_index),
+            chunk_id,
+            blocking_cp,
+        }
+    }
+
+    pub fn for_objects(
+        http_client: HttpClient,
+        events_to_index: Vec<DynamicIndexingObject>,
+        chunk_id: String,
+        blocking_cp: PgConnectionPool,
+    ) -> Self {
+        Self {
+            http_client,
+            data: DynamicIndexingData::Objects(events_to_index),
             chunk_id,
             blocking_cp,
         }
@@ -116,6 +137,59 @@ impl DynamicHandler {
             Ok::<(), IndexerError>(())
         })
         .context("Failed to insert events")
+    }
+
+    async fn insert_object_changes(
+        &self,
+        mutated_objects: Vec<Object>,
+        deleted_objects: Vec<Object>,
+    ) -> Result<(), IndexerError> {
+        transactional_blocking!(&self.blocking_cp, |conn| {
+            let mut mutated_object_groups = group_and_sort_objects(mutated_objects);
+            loop {
+                let mutated_object_group = mutated_object_groups
+                    .iter_mut()
+                    .filter_map(|group| group.pop())
+                    .collect::<Vec<_>>();
+                if mutated_object_group.is_empty() {
+                    break;
+                }
+                // bulk insert/update via UNNEST trick
+                let insert_update_query =
+                    compose_object_bulk_insert_update_query(&mutated_object_group);
+                diesel::sql_query(insert_update_query)
+                    .execute(conn)
+                    .map_err(|e| {
+                        IndexerError::PostgresWriteError(format!(
+                            "Failed writing mutated objects to PostgresDB with error: {:?}",
+                            e
+                        ))
+                    })?;
+            }
+
+            for deleted_object_change_chunk in deleted_objects.chunks(PG_COMMIT_CHUNK_SIZE) {
+                diesel::insert_into(objects::table)
+                    .values(deleted_object_change_chunk)
+                    .on_conflict(objects::object_id)
+                    .do_update()
+                    .set((
+                        objects::epoch.eq(excluded(objects::epoch)),
+                        objects::checkpoint.eq(excluded(objects::checkpoint)),
+                        objects::version.eq(excluded(objects::version)),
+                        objects::previous_transaction.eq(excluded(objects::previous_transaction)),
+                        objects::object_status.eq(excluded(objects::object_status)),
+                    ))
+                    .execute(conn)
+                    .map_err(|e| {
+                        IndexerError::PostgresWriteError(format!(
+                            "Failed writing deleted objects to PostgresDB with error: {:?}",
+                            e
+                        ))
+                    })?;
+            }
+
+            Ok::<(), IndexerError>(())
+        })
     }
 
     async fn update_sequence_number(&self, seq_no: i64) -> Result<(), IndexerError> {
@@ -238,12 +312,154 @@ impl DynamicHandler {
             .collect::<Vec<_>>()
     }
 
-    async fn start_reindexing_for_objects(&self) -> Result<(), IndexerError> {
-        // Start reindexing for objects.
-        if let DynamicIndexingData::Objects(objects_to_index) = &self.data {
-            todo!()
-        }
+    fn get_object_changes_from_checkpointdata(
+        checkpoint_data: &CheckpointData,
+    ) -> Vec<TransactionObjectChanges> {
+        let CheckpointData {
+            checkpoint,
+            transactions,
+            changed_objects,
+        } = checkpoint_data;
 
+        let tx_objects = changed_objects
+            .iter()
+            // Unwrap safe here as we requested previous tx data in the request.
+            .fold(BTreeMap::<_, Vec<_>>::new(), |mut acc, (status, o)| {
+                if let Some(digest) = &o.previous_transaction {
+                    acc.entry(*digest).or_default().push((status, o));
+                }
+                acc
+            });
+
+        let objects_changes = transactions
+            .iter()
+            .map(|tx| {
+                let changed_db_objects = tx_objects
+                    .get(&tx.digest)
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .map(|(status, o)| {
+                        Object::from(
+                            checkpoint.epoch,
+                            Some(checkpoint.sequence_number),
+                            status,
+                            o,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let deleted_objects = get_deleted_db_objects(
+                    &tx.effects,
+                    checkpoint.epoch,
+                    Some(checkpoint.sequence_number),
+                );
+
+                TransactionObjectChanges {
+                    changed_objects: changed_db_objects,
+                    deleted_objects,
+                }
+            })
+            .collect();
+
+        objects_changes
+    }
+
+    async fn start_reindexing_for_objects(&self) -> Result<(), IndexerError> {
+        if let DynamicIndexingData::Objects(objects_to_index) = &self.data {
+            let last_sequence_number = self.get_last_sequence_number().await?;
+            let mut current_parallel_downloads = MAX_PARALLEL_DOWNLOADS;
+            let mut next_cursor_sequence_number = last_sequence_number + 1;
+            let upto = self.get_upto()?;
+
+            // Iterate until we reach the `upto`.
+            while next_cursor_sequence_number < upto {
+                info!(
+                "DynamicHandler: (Upto: {}) Downloading checkpoints from sequence number {} to {}.",
+                upto,
+                next_cursor_sequence_number,
+                next_cursor_sequence_number + current_parallel_downloads as i64
+            );
+                let download_futures = (next_cursor_sequence_number
+                    ..(next_cursor_sequence_number + current_parallel_downloads as i64))
+                    .map(|seq| self.download_checkpoint_data(seq as u64));
+                let download_results = join_all(download_futures).await;
+
+                let mut downloaded_checkpoints = vec![];
+                next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
+
+                for download_result in download_results {
+                    if let Ok(checkpoint) = download_result {
+                        downloaded_checkpoints.push(checkpoint);
+                    } else {
+                        if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) =
+                            download_result
+                        {
+                            warn!(
+                                "Unexpected response from fullnode for checkpoints: {}",
+                                fn_e
+                            );
+                        } else if let Err(IndexerError::FullNodeReadingError(fn_e)) =
+                            download_result
+                        {
+                            warn!("Fullnode reading error for checkpoints {}: {}. It can be transient or due to rate limiting.", next_cursor_sequence_number, fn_e);
+                        } else {
+                            warn!("Error downloading checkpoints: {:?}", download_result);
+                        }
+                        break;
+                    }
+                }
+
+                next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
+                current_parallel_downloads =
+                    std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
+
+                if downloaded_checkpoints.is_empty() {
+                    warn!(
+                        "No checkpoints were downloaded for sequence number {}, retrying...",
+                        next_cursor_sequence_number
+                    );
+                    continue;
+                }
+
+                for checkpoint in downloaded_checkpoints {
+                    let tx_object_changes =
+                        Self::get_object_changes_from_checkpointdata(&checkpoint);
+                    let mutated_objects: Vec<Object> = tx_object_changes
+                        .iter()
+                        .flat_map(|changes| changes.changed_objects.iter().cloned())
+                        .filter(|o| {
+                            objects_to_index
+                                .iter()
+                                .any(|e| e.object_type == o.object_type)
+                        })
+                        .collect();
+                    let deleted_changes = tx_object_changes
+                        .iter()
+                        .flat_map(|changes| changes.deleted_objects.iter().cloned())
+                        .filter(|o| {
+                            objects_to_index
+                                .iter()
+                                .any(|e| e.object_type == o.object_type)
+                        })
+                        .collect::<Vec<_>>();
+                    let deleted_objects: Vec<Object> = deleted_changes
+                        .iter()
+                        .map(|deleted_object| deleted_object.clone().into())
+                        .collect();
+
+                    // Save the object changes
+                    self.insert_object_changes(mutated_objects, deleted_objects)
+                        .await?;
+                }
+
+                // Increase the indexed sequence number in the `dynamic_indexing_events` table.
+                self.update_sequence_number(next_cursor_sequence_number)
+                    .await?;
+            }
+            info!(
+                "DynamicHandler: Finished reindexing for events for chunk: {}.",
+                self.chunk_id
+            );
+        }
         Ok(())
     }
 
@@ -301,7 +517,7 @@ impl DynamicHandler {
                         "No checkpoints were downloaded for sequence number {}, retrying...",
                         next_cursor_sequence_number
                     );
-                    // continue;
+                    continue;
                 }
 
                 for checkpoint in downloaded_checkpoints {
