@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use diesel::QueryDsl;
 use futures::future::join_all;
@@ -72,6 +72,71 @@ impl DynamicHandler {
             chunk_id,
             blocking_cp,
         }
+    }
+
+    pub fn get_all_partially_indexed_chunks(
+        blocking_cp: &PgConnectionPool,
+    ) -> Result<(Vec<DynamicIndexingEvent>, Vec<DynamicIndexingObject>), IndexerError> {
+        read_only_blocking!(blocking_cp, |conn| {
+            let events = dynamic_indexing_events::table
+                .filter(diesel::BoolExpressionMethods::and(
+                    dynamic_indexing_events::picked.eq(true),
+                    dynamic_indexing_events::upto.gt(dynamic_indexing_events::sequence_number),
+                ))
+                .load::<DynamicIndexingEvent>(conn)?;
+
+            let objects = dynamic_indexing_objects::table
+                .filter(diesel::BoolExpressionMethods::and(
+                    dynamic_indexing_objects::picked.eq(true),
+                    dynamic_indexing_objects::upto.gt(dynamic_indexing_objects::sequence_number),
+                ))
+                .load::<DynamicIndexingObject>(conn)?;
+
+            Ok::<(Vec<DynamicIndexingEvent>, Vec<DynamicIndexingObject>), IndexerError>((
+                events, objects,
+            ))
+        })
+    }
+
+    pub fn resume_dynamic_indexing(
+        http_client: HttpClient,
+        blocking_cp: PgConnectionPool,
+    ) -> Result<(), IndexerError> {
+        let (events, objects) = Self::get_all_partially_indexed_chunks(&blocking_cp)?;
+        let mut grouped_objects = HashMap::<String, Vec<DynamicIndexingObject>>::new();
+        let mut grouped_events = HashMap::<String, Vec<DynamicIndexingEvent>>::new();
+
+        for o in objects {
+            if let Some(chunk_id) = &o.chunk_id {
+                if grouped_objects.contains_key(chunk_id) {
+                    grouped_objects.get_mut(chunk_id).unwrap().push(o.clone());
+                } else {
+                    grouped_objects.insert(chunk_id.clone(), vec![o.clone()]);
+                }
+            }
+        }
+
+        for e in events {
+            if let Some(chunk_id) = &e.chunk_id {
+                if grouped_events.contains_key(chunk_id) {
+                    grouped_events.get_mut(chunk_id).unwrap().push(e.clone());
+                } else {
+                    grouped_events.insert(chunk_id.clone(), vec![e.clone()]);
+                }
+            }
+        }
+
+        for (key, value) in grouped_events.into_iter() {
+            let handler = Self::for_events(http_client.clone(), value, key, blocking_cp.clone());
+            handler.spawn()?;
+        }
+
+        for (key, value) in grouped_objects.into_iter() {
+            let handler = Self::for_objects(http_client.clone(), value, key, blocking_cp.clone());
+            handler.spawn()?;
+        }
+
+        Ok(())
     }
 
     pub fn spawn(self) -> Result<(), IndexerError> {

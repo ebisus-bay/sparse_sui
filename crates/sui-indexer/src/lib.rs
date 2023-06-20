@@ -34,7 +34,7 @@ use sui_core::event_handler::SubscriptionHandler;
 use sui_json_rpc::{JsonRpcServerBuilder, ServerHandle, CLIENT_SDK_TYPE_HEADER};
 use sui_sdk::{SuiClient, SuiClientBuilder};
 
-use crate::apis::MoveUtilsApi;
+use crate::{apis::MoveUtilsApi, handlers::dynamic_handler::DynamicHandler};
 
 pub mod apis;
 pub mod errors;
@@ -176,6 +176,7 @@ impl Indexer {
         store: S,
         metrics: IndexerMetrics,
         custom_runtime: Option<Handle>,
+        blocking_cp: PgConnectionPool,
     ) -> Result<(), IndexerError> {
         info!(
             "Sui indexer of version {:?} started...",
@@ -201,13 +202,14 @@ impl Indexer {
             let mut processor_orchestrator = ProcessorOrchestrator::new(store.clone(), registry);
             spawn_monitored_task!(processor_orchestrator.run_forever());
 
+            let cb_cp = blocking_cp.clone();
             backoff::future::retry(ExponentialBackoff::default(), || async {
                 let event_handler_clone = event_handler.clone();
                 let metrics_clone = metrics.clone();
                 let http_client = get_http_client(config.rpc_client_url.as_str())?;
                 let cp = CheckpointHandler::new(
                     store.clone(),
-                    http_client,
+                    http_client.clone(),
                     event_handler_clone,
                     metrics_clone,
                     config,
@@ -215,6 +217,10 @@ impl Indexer {
                 cp.spawn()
                     .await
                     .expect("Indexer main should not run into errors.");
+
+                // Spawn tasks to resume the dynamic indexing of events and objects using `DynamicHandler`.
+                DynamicHandler::resume_dynamic_indexing(http_client, cb_cp.clone())?;
+
                 Ok(())
             })
             .await
