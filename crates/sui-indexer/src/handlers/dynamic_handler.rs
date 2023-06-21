@@ -102,6 +102,7 @@ impl DynamicHandler {
         http_client: HttpClient,
         blocking_cp: PgConnectionPool,
     ) -> Result<(), IndexerError> {
+        println!("DynamicHandler: Resuming reindexing for events and objects.");
         let (events, objects) = Self::get_all_partially_indexed_chunks(&blocking_cp)?;
         let mut grouped_objects = HashMap::<String, Vec<DynamicIndexingObject>>::new();
         let mut grouped_events = HashMap::<String, Vec<DynamicIndexingEvent>>::new();
@@ -127,11 +128,19 @@ impl DynamicHandler {
         }
 
         for (key, value) in grouped_events.into_iter() {
+            info!(
+                "DynamicHandler: Resuming reindexing for events for chunk: {}.",
+                &key
+            );
             let handler = Self::for_events(http_client.clone(), value, key, blocking_cp.clone());
             handler.spawn()?;
         }
 
         for (key, value) in grouped_objects.into_iter() {
+            info!(
+                "DynamicHandler: Resuming reindexing for objects for chunk: {}.",
+                &key
+            );
             let handler = Self::for_objects(http_client.clone(), value, key, blocking_cp.clone());
             handler.spawn()?;
         }

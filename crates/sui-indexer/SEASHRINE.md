@@ -12,6 +12,12 @@ To disable warning logs from the binary use the following command:
 RUST_LOG="warn=off" cargo run --bin sui-indexer -- --db-url "postgresql://postgres:postgres@localhost:5432/sui_indexer" --rpc-client-url "http://127.0.0.1:9000" --rpc-server-worker --fullnode-sync-worker --rpc-server-port 8000
 ```
 
+To run the local sui node run the following command:
+
+```bash
+RUST_LOG="consensus=off" cargo run --bin sui-test-validator --jobs 1
+```
+
 ## RPC documentation
 
 ### seashrine_getDisplayObjects

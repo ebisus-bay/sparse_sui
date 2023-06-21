@@ -207,6 +207,10 @@ impl Indexer {
                 let event_handler_clone = event_handler.clone();
                 let metrics_clone = metrics.clone();
                 let http_client = get_http_client(config.rpc_client_url.as_str())?;
+
+                // Spawn tasks to resume the dynamic indexing of events and objects using `DynamicHandler`.
+                DynamicHandler::resume_dynamic_indexing(http_client.clone(), cb_cp.clone())?;
+
                 let cp = CheckpointHandler::new(
                     store.clone(),
                     http_client.clone(),
@@ -217,9 +221,6 @@ impl Indexer {
                 cp.spawn()
                     .await
                     .expect("Indexer main should not run into errors.");
-
-                // Spawn tasks to resume the dynamic indexing of events and objects using `DynamicHandler`.
-                DynamicHandler::resume_dynamic_indexing(http_client, cb_cp.clone())?;
 
                 Ok(())
             })
