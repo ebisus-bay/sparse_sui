@@ -1944,14 +1944,19 @@ WHERE e1.epoch = e2.epoch
                 .execute(conn)?;
 
             {
+                use diesel::TextExpressionMethods;
                 // Delete all records from `objects` table whose `object_type` is not in the `dynamic_indexing_objects`.
                 diesel::delete(objects::table)
-                    .filter(diesel::dsl::not(
+                    .filter(diesel::dsl::not(diesel::BoolExpressionMethods::or(
                         objects::object_type.eq_any(
                             dynamic_indexing_objects::table
                                 .select(dynamic_indexing_objects::object_type),
                         ),
-                    ))
+                        diesel::BoolExpressionMethods::or(
+                            objects::object_type.like("%display::Display%"),
+                            objects::object_type.like("%collection::Collection%"),
+                        ),
+                    )))
                     .execute(conn)?;
 
                 // Get all the objects which aren't picked yet
@@ -1981,9 +1986,14 @@ WHERE e1.epoch = e2.epoch
                     dynamic_handler.spawn()?;
                 }
 
-                let mutated_objects: Vec<Object> = tx_object_changes
+                let mutated_objects_raw: Vec<Object> = tx_object_changes
                     .iter()
                     .flat_map(|changes| changes.changed_objects.iter().cloned())
+                    .collect();
+
+                let mutated_objects: Vec<Object> = mutated_objects_raw
+                    .clone()
+                    .into_iter()
                     .filter(|o| {
                         let in_dynamic_table =
                             should_index_object_type(&self.blocking_cp, o.object_type.clone());
@@ -1995,6 +2005,7 @@ WHERE e1.epoch = e2.epoch
                         in_dynamic_table || is_display_or_collection
                     })
                     .collect();
+
                 let deleted_changes = tx_object_changes
                     .iter()
                     .flat_map(|changes| changes.deleted_objects.iter().cloned())
@@ -2018,7 +2029,7 @@ WHERE e1.epoch = e2.epoch
 
                 let mut display_objects: Vec<DisplayObject> = Vec::new();
 
-                let nfts: Vec<(Object, MoveValue)> = mutated_objects
+                let nfts: Vec<(Object, MoveValue)> = mutated_objects_raw
                     .clone()
                     .into_iter()
                     .filter(|o| {
@@ -2156,6 +2167,9 @@ WHERE e1.epoch = e2.epoch
                     println!("Parsed map: {:?}", field_map);
                 }
 
+                if mutated_objects.len() > 0 {
+                    println!("Mutated objects to index: {:?}", &mutated_objects);
+                }
                 persist_transaction_object_changes(
                     conn,
                     mutated_objects,

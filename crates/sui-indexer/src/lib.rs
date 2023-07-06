@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use url::Url;
 
 use apis::{
-    CoinReadApi, ExtendedApi, GovernanceReadApi, IndexerApi, ReadApi, TransactionBuilderApi,
-    WriteApi,
+    seashrine_api::SeashrineApi, CoinReadApi, ExtendedApi, GovernanceReadApi, IndexerApi, ReadApi,
+    TransactionBuilderApi, WriteApi,
 };
 use errors::IndexerError;
 use handlers::checkpoint_handler::CheckpointHandler;
@@ -340,6 +340,10 @@ pub async fn build_json_rpc_server<S: IndexerStore + Sync + Send + 'static + Clo
         http_client.clone(),
         config.migrated_methods.clone(),
     ))?;
+
+    // Register custom RPC modules
+    builder.register_module(SeashrineApi::new(http_client.clone(), state.clone()))?;
+
     builder.register_module(CoinReadApi::new(http_client.clone()))?;
     builder.register_module(TransactionBuilderApi::new(http_client.clone()))?;
     builder.register_module(GovernanceReadApi::new(http_client.clone()))?;

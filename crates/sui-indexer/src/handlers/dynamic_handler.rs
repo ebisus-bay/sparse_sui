@@ -17,7 +17,6 @@ use crate::models::events::Event;
 use crate::models::objects::{
     compose_object_bulk_insert_update_query, group_and_sort_objects, Object,
 };
-use crate::schema::checkpoints::sequence_number;
 use crate::schema::{dynamic_indexing_events, dynamic_indexing_objects, events, objects};
 use crate::store::diesel_marco::{read_only_blocking, transactional_blocking};
 use crate::store::{CheckpointData, TransactionObjectChanges};
@@ -102,7 +101,7 @@ impl DynamicHandler {
         http_client: HttpClient,
         blocking_cp: PgConnectionPool,
     ) -> Result<(), IndexerError> {
-        println!("DynamicHandler: Resuming reindexing for events and objects.");
+        info!("DynamicHandler: Resuming reindexing for events and objects.");
         let (events, objects) = Self::get_all_partially_indexed_chunks(&blocking_cp)?;
         let mut grouped_objects = HashMap::<String, Vec<DynamicIndexingObject>>::new();
         let mut grouped_events = HashMap::<String, Vec<DynamicIndexingEvent>>::new();
@@ -152,7 +151,7 @@ impl DynamicHandler {
         match &self.data {
             DynamicIndexingData::Events(_) => {
                 spawn_monitored_task!(async move {
-                    println!("Starting reindexing for events.");
+                    info!("Starting reindexing for events.");
                     let mut events_reindexing_response = self.start_reindexing_for_events().await;
                     while let Err(_) = &events_reindexing_response {
                         warn!("Issue while reindexing events.");
@@ -163,7 +162,7 @@ impl DynamicHandler {
             }
             DynamicIndexingData::Objects(_) => {
                 spawn_monitored_task!(async move {
-                    println!("Starting reindexing for objects.");
+                    info!("Starting reindexing for objects.");
                     let mut objects_reindexing_response = self.start_reindexing_for_objects().await;
                     while let Err(_) = &objects_reindexing_response {
                         warn!("Issue while reindexing objects.");

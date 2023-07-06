@@ -83,6 +83,11 @@ pub fn is_display_or_collection_type(
         .as_str(),
     )
     .unwrap();
+    println!(
+        "display, collection: {}, {}",
+        display_regex.is_match(object_type),
+        collection_type.is_match(object_type)
+    );
 
     display_regex.is_match(object_type) || collection_type.is_match(object_type)
 }
